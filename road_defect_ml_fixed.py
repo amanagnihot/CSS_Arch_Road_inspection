@@ -1594,3 +1594,2544 @@ print("="*80)
 
 from google.colab import drive
 drive.mount('/content/drive')
+
+"""10-02-26
+
+"""
+
+#DATA SEGEREGATING
+
+"""
+================================================================================
+STEP 1: EXPLORE PARENT DATASET - Road_defects.v3i.yolov11.zip
+================================================================================
+Carefully examine everything before touching or splitting anything
+Output saved to Google Drive automatically
+================================================================================
+"""
+
+import os
+import cv2
+import zipfile
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+import shutil
+from pathlib import Path
+from collections import defaultdict
+from google.colab import drive
+
+# ============================================================================
+# MOUNT GOOGLE DRIVE - ALL OUTPUTS SAVED HERE
+# ============================================================================
+print("📂 Mounting Google Drive...")
+drive.mount('/content/drive')
+
+OUTPUT_DIR = '/content/drive/MyDrive/Road_Defect_Project/01_Dataset_Exploration'
+os.makedirs(OUTPUT_DIR, exist_ok=True)
+print(f"✅ Outputs will be saved to: {OUTPUT_DIR}\n")
+
+# ============================================================================
+# STEP 1: EXTRACT ZIP
+# ============================================================================
+ZIP_PATH = '/content/Road_defects.v3i.yolov11.zip'
+EXTRACT_PATH = '/content/Road_defects_parent'
+
+print("="*80)
+print("STEP 1: EXTRACTING DATASET")
+print("="*80)
+
+if not os.path.exists(ZIP_PATH):
+    print(f"❌ ZIP not found at: {ZIP_PATH}")
+    print("Please upload the zip file first!")
+    exit()
+
+print(f"✅ Found zip: {ZIP_PATH}")
+print(f"   Size: {os.path.getsize(ZIP_PATH) / (1024*1024):.2f} MB")
+
+print(f"\n⏳ Extracting to {EXTRACT_PATH}...")
+os.makedirs(EXTRACT_PATH, exist_ok=True)
+
+with zipfile.ZipFile(ZIP_PATH, 'r') as zip_ref:
+    all_files = zip_ref.namelist()
+    zip_ref.extractall(EXTRACT_PATH)
+
+print(f"✅ Extracted {len(all_files)} files total")
+
+# ============================================================================
+# STEP 2: EXPLORE FULL DIRECTORY STRUCTURE
+# ============================================================================
+print("\n" + "="*80)
+print("STEP 2: FULL DIRECTORY STRUCTURE")
+print("="*80)
+
+structure_lines = []
+for root, dirs, files in os.walk(EXTRACT_PATH):
+    # Skip hidden dirs
+    dirs[:] = [d for d in dirs if not d.startswith('.')]
+
+    level = root.replace(EXTRACT_PATH, '').count(os.sep)
+    indent = '  ' * level
+    folder_name = os.path.basename(root)
+
+    n_files = len(files)
+    line = f"{indent}📁 {folder_name}/ ({n_files} files)"
+    print(line)
+    structure_lines.append(line)
+
+    # Show file types summary
+    if files:
+        ext_count = defaultdict(int)
+        for f in files:
+            ext = Path(f).suffix.lower()
+            ext_count[ext] += 1
+
+        sub_indent = '  ' * (level + 1)
+        for ext, count in sorted(ext_count.items()):
+            line = f"{sub_indent}📄 {ext if ext else 'no ext'}: {count} files"
+            print(line)
+            structure_lines.append(line)
+
+# Save structure to file
+with open(f'{OUTPUT_DIR}/directory_structure.txt', 'w') as f:
+    f.write('\n'.join(structure_lines))
+print(f"\n✅ Structure saved to Drive")
+
+# ============================================================================
+# STEP 3: FIND AND READ CONFIG FILES
+# ============================================================================
+print("\n" + "="*80)
+print("STEP 3: CONFIG & METADATA FILES")
+print("="*80)
+
+# Find all yaml, txt config files
+config_files = []
+for ext in ['*.yaml', '*.yml', '*.txt', '*.json', '*.md']:
+    config_files.extend(list(Path(EXTRACT_PATH).rglob(ext)))
+
+# Filter out label txt files
+config_files = [f for f in config_files if 'labels' not in str(f).lower()
+                or f.name in ['README.md', 'data.yaml', 'dataset.yaml']]
+
+print(f"\nFound {len(config_files)} config/meta files:")
+
+config_content = {}
+for cfg_path in config_files:
+    print(f"\n{'='*60}")
+    print(f"📄 {cfg_path.name} — {cfg_path}")
+    print(f"{'='*60}")
+
+    try:
+        with open(cfg_path, 'r') as f:
+            content = f.read()
+            print(content)
+            config_content[cfg_path.name] = content
+    except:
+        print("  (Could not read file)")
+
+# Save configs
+with open(f'{OUTPUT_DIR}/config_files_content.txt', 'w') as f:
+    for name, content in config_content.items():
+        f.write(f"\n{'='*60}\n{name}\n{'='*60}\n{content}\n")
+print(f"\n✅ Config content saved to Drive")
+
+# ============================================================================
+# STEP 4: ANALYZE ALL LABEL FILES
+# ============================================================================
+print("\n" + "="*80)
+print("STEP 4: ANALYZING ALL LABEL FILES")
+print("="*80)
+
+label_files = list(Path(EXTRACT_PATH).rglob('*.txt'))
+label_files = [f for f in label_files if 'labels' in str(f).lower()]
+
+print(f"Found {len(label_files)} label files")
+
+all_annotations = []
+class_counts_per_split = defaultdict(lambda: defaultdict(int))
+
+for label_path in label_files:
+    # Determine split from path
+    parts = label_path.parts
+    split = 'unknown'
+    for part in parts:
+        if part.lower() in ['train', 'valid', 'test', 'validation']:
+            split = part.lower()
+            break
+
+    # Read annotations
+    try:
+        with open(label_path, 'r') as f:
+            for line in f:
+                parts_line = line.strip().split()
+                if len(parts_line) >= 5:
+                    class_id = int(parts_line[0])
+                    x_center = float(parts_line[1])
+                    y_center = float(parts_line[2])
+                    width = float(parts_line[3])
+                    height = float(parts_line[4])
+
+                    all_annotations.append({
+                        'split': split,
+                        'label_file': label_path.name,
+                        'class_id': class_id,
+                        'x_center': x_center,
+                        'y_center': y_center,
+                        'width': width,
+                        'height': height,
+                        'area': width * height
+                    })
+                    class_counts_per_split[split][class_id] += 1
+    except:
+        continue
+
+df_annotations = pd.DataFrame(all_annotations)
+
+print(f"\n✅ Total annotations found: {len(df_annotations)}")
+print(f"   Unique class IDs: {sorted(df_annotations['class_id'].unique())}")
+print(f"   Splits found: {df_annotations['split'].unique()}")
+
+# ============================================================================
+# STEP 5: CLASS DISTRIBUTION ANALYSIS
+# ============================================================================
+print("\n" + "="*80)
+print("STEP 5: CLASS DISTRIBUTION")
+print("="*80)
+
+# Try to get class names from yaml
+class_names = {}
+yaml_files = list(Path(EXTRACT_PATH).rglob('*.yaml'))
+
+for yaml_path in yaml_files:
+    try:
+        with open(yaml_path, 'r') as f:
+            content = f.read()
+            # Parse class names
+            if 'names' in content:
+                lines = content.split('\n')
+                reading_names = False
+                for line in lines:
+                    if 'names:' in line:
+                        reading_names = True
+                        # Check if inline: names: ['class1', 'class2']
+                        if '[' in line:
+                            names_str = line.split('names:')[1].strip()
+                            names_str = names_str.strip("[]'\" ")
+                            names = [n.strip().strip("'\"") for n in names_str.split(',')]
+                            for i, name in enumerate(names):
+                                if name:
+                                    class_names[i] = name
+                            reading_names = False
+                        continue
+                    if reading_names and line.strip().startswith('-'):
+                        name = line.strip().lstrip('- ').strip().strip("'\"")
+                        if name:
+                            idx = len(class_names)
+                            class_names[idx] = name
+                    elif reading_names and line.strip() and not line.strip().startswith('-') and ':' not in line:
+                        reading_names = False
+        if class_names:
+            print(f"✅ Class names from: {yaml_path.name}")
+            break
+    except:
+        continue
+
+if not class_names:
+    # Default names based on known dataset
+    class_names = {
+        0: 'Big_Culvert',
+        1: 'Blocked_culvert',
+        2: 'Cause_ways',
+        3: 'Crack',
+        4: 'Culvert'
+    }
+    print("⚠️  Using default class names")
+
+print(f"\n📋 Classes detected:")
+for idx, name in class_names.items():
+    print(f"   Class {idx}: {name}")
+
+# Per split distribution
+print(f"\n📊 Distribution per split:")
+split_summary = []
+for split in sorted(df_annotations['split'].unique()):
+    split_df = df_annotations[df_annotations['split'] == split]
+    print(f"\n  {split.upper()}:")
+
+    n_images = split_df['label_file'].nunique()
+    print(f"    Total images with labels: {n_images}")
+    print(f"    Total annotations: {len(split_df)}")
+    print(f"    Avg annotations per image: {len(split_df)/n_images:.2f}")
+
+    for class_id in sorted(split_df['class_id'].unique()):
+        class_df = split_df[split_df['class_id'] == class_id]
+        class_name = class_names.get(class_id, f'Class_{class_id}')
+        pct = len(class_df) / len(split_df) * 100
+        print(f"    {class_name:20s}: {len(class_df):5d} ({pct:.1f}%)")
+        split_summary.append({
+            'split': split,
+            'class_id': class_id,
+            'class_name': class_name,
+            'count': len(class_df),
+            'percentage': pct
+        })
+
+# Save distribution
+split_df_summary = pd.DataFrame(split_summary)
+split_df_summary.to_csv(f'{OUTPUT_DIR}/class_distribution.csv', index=False)
+print(f"\n✅ Distribution saved to Drive")
+
+# ============================================================================
+# STEP 6: SAMPLE IMAGE ANALYSIS
+# ============================================================================
+print("\n" + "="*80)
+print("STEP 6: IMAGE PROPERTIES ANALYSIS")
+print("="*80)
+
+image_files = list(Path(EXTRACT_PATH).rglob('*.jpg'))
+image_files += list(Path(EXTRACT_PATH).rglob('*.png'))
+image_files += list(Path(EXTRACT_PATH).rglob('*.jpeg'))
+
+print(f"Total images found: {len(image_files)}")
+
+# Sample 50 images for analysis
+sample_images = image_files[:50]
+widths, heights, channels_list = [], [], []
+
+for img_path in sample_images:
+    img = cv2.imread(str(img_path))
+    if img is not None:
+        h, w, c = img.shape
+        widths.append(w)
+        heights.append(h)
+        channels_list.append(c)
+
+if widths:
+    print(f"\n📐 Image Dimensions (from {len(widths)} samples):")
+    print(f"   Width:  min={min(widths)}, max={max(widths)}, avg={np.mean(widths):.0f}")
+    print(f"   Height: min={min(heights)}, max={max(heights)}, avg={np.mean(heights):.0f}")
+    print(f"   Channels: {set(channels_list)}")
+
+# ============================================================================
+# STEP 7: VISUALIZATION
+# ============================================================================
+print("\n" + "="*80)
+print("STEP 7: GENERATING VISUALIZATIONS")
+print("="*80)
+
+# Plot 1: Class distribution
+fig, axes = plt.subplots(1, 2, figsize=(16, 6))
+fig.suptitle('Road Defects Dataset — Class Distribution', fontsize=16, fontweight='bold')
+
+colors = ['#FF6B6B', '#4ECDC4', '#45B7D1', '#96CEB4', '#FFEAA7']
+
+# Overall distribution
+class_totals = df_annotations.groupby('class_id').size()
+class_labels = [class_names.get(i, f'Class_{i}') for i in class_totals.index]
+
+axes[0].bar(class_labels, class_totals.values, color=colors[:len(class_totals)])
+axes[0].set_title('Total Annotations per Class', fontweight='bold')
+axes[0].set_xlabel('Class')
+axes[0].set_ylabel('Count')
+axes[0].tick_params(axis='x', rotation=30)
+for i, v in enumerate(class_totals.values):
+    axes[0].text(i, v + 10, str(v), ha='center', fontweight='bold')
+axes[0].grid(True, alpha=0.3)
+
+# Per split distribution
+splits = sorted(df_annotations['split'].unique())
+x = np.arange(len(class_names))
+width = 0.8 / len(splits)
+
+for i, split in enumerate(splits):
+    split_data = df_annotations[df_annotations['split'] == split]
+    counts = [len(split_data[split_data['class_id'] == cid]) for cid in sorted(class_names.keys())]
+    axes[1].bar(x + i * width, counts, width, label=split, alpha=0.8)
+
+axes[1].set_title('Distribution per Split', fontweight='bold')
+axes[1].set_xlabel('Class')
+axes[1].set_ylabel('Count')
+axes[1].set_xticks(x + width * (len(splits)-1) / 2)
+axes[1].set_xticklabels([class_names[i] for i in sorted(class_names.keys())], rotation=30)
+axes[1].legend()
+axes[1].grid(True, alpha=0.3)
+
+plt.tight_layout()
+plt.savefig(f'{OUTPUT_DIR}/class_distribution.png', dpi=150, bbox_inches='tight')
+plt.close()
+print("✅ Distribution chart saved")
+
+# Plot 2: Sample images with annotations
+print("\n⏳ Generating sample image visualizations...")
+
+fig, axes = plt.subplots(3, 4, figsize=(20, 15))
+fig.suptitle('Sample Images with Annotations', fontsize=16, fontweight='bold')
+axes = axes.flatten()
+
+sample_count = 0
+for img_path in image_files:
+    if sample_count >= 12:
+        break
+
+    # Find corresponding label
+    label_path = None
+    for possible in [
+        img_path.parent.parent / 'labels' / (img_path.stem + '.txt'),
+        img_path.parent / (img_path.stem + '.txt')
+    ]:
+        if possible.exists():
+            label_path = possible
+            break
+
+    if label_path is None:
+        continue
+
+    img = cv2.imread(str(img_path))
+    if img is None:
+        continue
+
+    h, w = img.shape[:2]
+    img_rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+
+    # Draw annotations
+    with open(label_path, 'r') as f:
+        for line in f:
+            parts = line.strip().split()
+            if len(parts) >= 5:
+                cid = int(parts[0])
+                xc, yc = float(parts[1]) * w, float(parts[2]) * h
+                bw, bh = float(parts[3]) * w, float(parts[4]) * h
+                x1 = int(xc - bw/2)
+                y1 = int(yc - bh/2)
+                x2 = int(xc + bw/2)
+                y2 = int(yc + bh/2)
+
+                color_map = [(255,0,0), (0,255,0), (0,0,255), (255,255,0), (255,0,255)]
+                color = color_map[cid % len(color_map)]
+
+                cv2.rectangle(img_rgb, (x1, y1), (x2, y2), color, 2)
+                label_text = class_names.get(cid, str(cid))
+                cv2.putText(img_rgb, label_text, (x1, max(0, y1-5)),
+                           cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 1)
+
+    axes[sample_count].imshow(img_rgb)
+    axes[sample_count].set_title(img_path.name[:30], fontsize=8)
+    axes[sample_count].axis('off')
+    sample_count += 1
+
+for idx in range(sample_count, len(axes)):
+    axes[idx].axis('off')
+
+plt.tight_layout()
+plt.savefig(f'{OUTPUT_DIR}/sample_images_with_annotations.png', dpi=150, bbox_inches='tight')
+plt.close()
+print("✅ Sample visualization saved")
+
+# ============================================================================
+# STEP 8: FINAL SUMMARY
+# ============================================================================
+print("\n" + "="*80)
+print("DATASET EXPLORATION COMPLETE — FULL SUMMARY")
+print("="*80)
+
+print(f"\n📁 Dataset Location: {EXTRACT_PATH}")
+print(f"\n📊 Overview:")
+print(f"   Total images:      {len(image_files)}")
+print(f"   Total annotations: {len(df_annotations)}")
+print(f"   Total classes:     {len(class_names)}")
+print(f"   Splits:            {list(df_annotations['split'].unique())}")
+
+print(f"\n📋 Classes:")
+for idx, name in class_names.items():
+    total = len(df_annotations[df_annotations['class_id'] == idx])
+    print(f"   Class {idx}: {name:20s} — {total} annotations")
+
+print(f"\n💾 All outputs saved to Google Drive:")
+print(f"   📄 directory_structure.txt")
+print(f"   📄 config_files_content.txt")
+print(f"   📄 class_distribution.csv")
+print(f"   📊 class_distribution.png")
+print(f"   📊 sample_images_with_annotations.png")
+
+print(f"\n✅ Ready for next step: Split dataset by class!")
+print("="*80)
+
+"""DATA SPLITTER"""
+
+"""
+================================================================================
+STEP 2: SPLIT DATASET BY CLASS — One Dataset Per Class (Binary: Yes/No)
+================================================================================
+Parent Dataset: /content/Road_defects_parent
+Strategy:
+  - For each class: create POSITIVE samples (has this class) + NEGATIVE samples
+  - Maintain train/valid/test splits
+  - Handle class imbalance intelligently
+  - Save everything to Google Drive
+================================================================================
+"""
+
+import os
+import cv2
+import shutil
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+from pathlib import Path
+from collections import defaultdict
+from google.colab import drive
+
+# ============================================================================
+# MOUNT DRIVE
+# ============================================================================
+print("📂 Mounting Google Drive...")
+drive.mount('/content/drive')
+
+PARENT_DATA  = '/content/Road_defects_parent'
+OUTPUT_BASE  = '/content/drive/MyDrive/Road_Defect_Project/02_Per_Class_Datasets'
+WORKING_DIR  = '/content/per_class_datasets'  # local working copy
+
+os.makedirs(OUTPUT_BASE, exist_ok=True)
+os.makedirs(WORKING_DIR, exist_ok=True)
+
+print(f"✅ Parent data: {PARENT_DATA}")
+print(f"✅ Drive output: {OUTPUT_BASE}")
+
+# ============================================================================
+# CONFIGURATION
+# ============================================================================
+CLASS_NAMES = {
+    0:  'Big_Culvert',
+    1:  'Blocked_culvert',
+    2:  'Cause_ways',
+    3:  'Crack',
+    4:  'Culvert',
+    5:  'Damaged_surface_layer',
+    6:  'Drainage_cover',
+    7:  'Edge_breaking',
+    8:  'Guard_stone',
+    9:  'Not_painted_gs',
+    10: 'Not_whitewashed',
+    11: 'Patching',
+    12: 'Ravelling',
+    13: 'km_stone',
+    14: 'pothole'
+}
+
+SPLITS = ['train', 'valid', 'test']
+
+# Minimum samples needed to create a usable binary dataset
+MIN_POSITIVE_SAMPLES = 30
+
+# ============================================================================
+# HELPER FUNCTIONS
+# ============================================================================
+def load_annotations(label_path):
+    """Load YOLO annotations from a label file"""
+    annotations = []
+    if Path(label_path).exists():
+        with open(label_path, 'r') as f:
+            for line in f:
+                parts = line.strip().split()
+                if len(parts) >= 5:
+                    annotations.append({
+                        'class_id': int(parts[0]),
+                        'x_center': float(parts[1]),
+                        'y_center': float(parts[2]),
+                        'width':    float(parts[3]),
+                        'height':   float(parts[4]),
+                        'raw':      line.strip()
+                    })
+    return annotations
+
+
+def write_annotations(annotations, output_path):
+    """Write YOLO annotations to file"""
+    with open(output_path, 'w') as f:
+        for ann in annotations:
+            f.write(ann['raw'] + '\n')
+
+
+def write_binary_annotations(annotations, target_class_id, output_path):
+    """
+    Write annotations for binary classification:
+    - Keep only target class, remap to class 0 (POSITIVE)
+    - All other classes removed (we only care about target class bbox)
+    """
+    target_anns = [a for a in annotations if a['class_id'] == target_class_id]
+    with open(output_path, 'w') as f:
+        for ann in target_anns:
+            # Remap class_id to 0 for binary: 0 = this defect exists
+            f.write(f"0 {ann['x_center']} {ann['y_center']} {ann['width']} {ann['height']}\n")
+
+
+def create_data_yaml(class_name, dataset_path, output_path):
+    """Create data.yaml for binary dataset"""
+    yaml_content = f"""train: {dataset_path}/train/images
+val: {dataset_path}/valid/images
+test: {dataset_path}/test/images
+
+nc: 1
+names: ['{class_name}']
+
+# Binary detector: detects only '{class_name}'
+# 0 = {class_name} present
+"""
+    with open(output_path, 'w') as f:
+        f.write(yaml_content)
+
+# ============================================================================
+# STEP 1: SCAN ALL IMAGES AND BUILD INDEX
+# ============================================================================
+print("\n" + "="*80)
+print("STEP 1: SCANNING ALL IMAGES")
+print("="*80)
+
+# Build a complete index of all images and their annotations
+image_index = defaultdict(dict)
+
+for split in SPLITS:
+    images_dir = Path(PARENT_DATA) / split / 'images'
+    labels_dir = Path(PARENT_DATA) / split / 'labels'
+
+    if not images_dir.exists():
+        print(f"  ⚠️  Split '{split}' not found, skipping")
+        continue
+
+    img_files = list(images_dir.glob('*.jpg')) + \
+                list(images_dir.glob('*.jpeg')) + \
+                list(images_dir.glob('*.png'))
+
+    for img_path in img_files:
+        label_path = labels_dir / (img_path.stem + '.txt')
+        annotations = load_annotations(label_path)
+        classes_in_image = set(a['class_id'] for a in annotations)
+
+        image_index[split][img_path.stem] = {
+            'img_path':    img_path,
+            'label_path':  label_path,
+            'annotations': annotations,
+            'classes':     classes_in_image
+        }
+
+    print(f"  ✅ {split:6s}: {len(image_index[split])} images indexed")
+
+# ============================================================================
+# STEP 2: ANALYZE WHAT WE HAVE PER CLASS
+# ============================================================================
+print("\n" + "="*80)
+print("STEP 2: PER-CLASS AVAILABILITY ANALYSIS")
+print("="*80)
+
+class_analysis = {}
+
+for class_id, class_name in CLASS_NAMES.items():
+    analysis = {}
+    for split in SPLITS:
+        positive_imgs = [
+            stem for stem, info in image_index[split].items()
+            if class_id in info['classes']
+        ]
+        negative_imgs = [
+            stem for stem, info in image_index[split].items()
+            if class_id not in info['classes']
+        ]
+        analysis[split] = {
+            'positive': positive_imgs,
+            'negative': negative_imgs,
+            'n_positive': len(positive_imgs),
+            'n_negative': len(negative_imgs)
+        }
+
+    total_positive = sum(analysis[s]['n_positive'] for s in SPLITS)
+    feasible = total_positive >= MIN_POSITIVE_SAMPLES
+
+    class_analysis[class_id] = {
+        'name': class_name,
+        'splits': analysis,
+        'total_positive': total_positive,
+        'feasible': feasible
+    }
+
+    status = "✅" if feasible else "⚠️ "
+    print(f"  {status} Class {class_id:2d}: {class_name:25s} | "
+          f"Train: {analysis['train']['n_positive']:4d}+ "
+          f"{analysis['train']['n_negative']:4d}- | "
+          f"Valid: {analysis['valid']['n_positive']:3d}+ "
+          f"{analysis['valid']['n_negative']:3d}- | "
+          f"Total+: {total_positive}")
+
+feasible_classes  = [cid for cid, info in class_analysis.items() if info['feasible']]
+skipped_classes   = [cid for cid, info in class_analysis.items() if not info['feasible']]
+
+print(f"\n  ✅ Will create datasets for {len(feasible_classes)} classes")
+if skipped_classes:
+    print(f"  ⚠️  Skipping {len(skipped_classes)} classes with <{MIN_POSITIVE_SAMPLES} samples:")
+    for cid in skipped_classes:
+        print(f"       Class {cid}: {CLASS_NAMES[cid]} ({class_analysis[cid]['total_positive']} samples)")
+
+# ============================================================================
+# STEP 3: CREATE BINARY DATASETS
+# ============================================================================
+print("\n" + "="*80)
+print("STEP 3: CREATING PER-CLASS BINARY DATASETS")
+print("="*80)
+
+dataset_summary = []
+
+for class_id in feasible_classes:
+    class_name = CLASS_NAMES[class_id]
+    class_info = class_analysis[class_id]
+
+    print(f"\n  📁 Creating dataset for: {class_name}")
+
+    # Create directory structure
+    class_dir = Path(WORKING_DIR) / f"class_{class_id:02d}_{class_name}"
+
+    for split in SPLITS:
+        (class_dir / split / 'images').mkdir(parents=True, exist_ok=True)
+        (class_dir / split / 'labels').mkdir(parents=True, exist_ok=True)
+
+    split_counts = {}
+
+    for split in SPLITS:
+        split_info   = class_info['splits'][split]
+        positive_stems = split_info['positive']
+        negative_stems = split_info['negative']
+
+        # For negative sampling: balance with positive count
+        # Use at most 2x positive samples as negatives to avoid extreme imbalance
+        n_positives = len(positive_stems)
+        n_neg_to_use = min(len(negative_stems), max(n_positives * 2, 50))
+
+        # Randomly sample negatives
+        np.random.seed(42)
+        if len(negative_stems) > n_neg_to_use:
+            selected_negatives = list(np.random.choice(
+                negative_stems, n_neg_to_use, replace=False
+            ))
+        else:
+            selected_negatives = negative_stems
+
+        copied_pos = 0
+        copied_neg = 0
+        errors     = 0
+
+        # Copy POSITIVE samples
+        for stem in positive_stems:
+            info        = image_index[split][stem]
+            img_src     = info['img_path']
+            img_dst     = class_dir / split / 'images' / img_src.name
+            label_dst   = class_dir / split / 'labels' / (stem + '.txt')
+
+            try:
+                shutil.copy2(img_src, img_dst)
+                # Write binary label (only target class, remapped to 0)
+                write_binary_annotations(info['annotations'], class_id, label_dst)
+                copied_pos += 1
+            except Exception as e:
+                errors += 1
+
+        # Copy NEGATIVE samples (images with no target class)
+        for stem in selected_negatives:
+            info      = image_index[split][stem]
+            img_src   = info['img_path']
+            img_dst   = class_dir / split / 'images' / img_src.name
+            label_dst = class_dir / split / 'labels' / (stem + '.txt')
+
+            try:
+                shutil.copy2(img_src, img_dst)
+                # Write empty label file (no target class = no annotations)
+                open(label_dst, 'w').close()
+                copied_neg += 1
+            except Exception as e:
+                errors += 1
+
+        split_counts[split] = {
+            'positive': copied_pos,
+            'negative': copied_neg,
+            'total':    copied_pos + copied_neg
+        }
+
+        print(f"    {split:6s}: {copied_pos:4d} positive + {copied_neg:4d} negative = "
+              f"{copied_pos + copied_neg:4d} total  (errors: {errors})")
+
+    # Create data.yaml
+    create_data_yaml(
+        class_name,
+        str(class_dir),
+        str(class_dir / 'data.yaml')
+    )
+
+    dataset_summary.append({
+        'class_id':        class_id,
+        'class_name':      class_name,
+        'train_positive':  split_counts['train']['positive'],
+        'train_negative':  split_counts['train']['negative'],
+        'train_total':     split_counts['train']['total'],
+        'valid_positive':  split_counts['valid']['positive'],
+        'valid_negative':  split_counts['valid']['negative'],
+        'valid_total':     split_counts['valid']['total'],
+        'dataset_path':    str(class_dir)
+    })
+
+# ============================================================================
+# STEP 4: COPY TO GOOGLE DRIVE
+# ============================================================================
+print("\n" + "="*80)
+print("STEP 4: SAVING TO GOOGLE DRIVE")
+print("="*80)
+
+print("⏳ Copying datasets to Drive (this may take a few minutes)...")
+
+for class_id in feasible_classes:
+    class_name = CLASS_NAMES[class_id]
+    src_dir    = Path(WORKING_DIR) / f"class_{class_id:02d}_{class_name}"
+    dst_dir    = Path(OUTPUT_BASE) / f"class_{class_id:02d}_{class_name}"
+
+    if dst_dir.exists():
+        shutil.rmtree(dst_dir)
+
+    shutil.copytree(src_dir, dst_dir)
+    print(f"  ✅ Saved: {class_name}")
+
+# ============================================================================
+# STEP 5: SUMMARY REPORT
+# ============================================================================
+print("\n" + "="*80)
+print("STEP 5: FINAL SUMMARY")
+print("="*80)
+
+df_summary = pd.DataFrame(dataset_summary)
+df_summary.to_csv(f'{OUTPUT_BASE}/dataset_split_summary.csv', index=False)
+
+print(f"\n{'Class':<25} {'Train+':>7} {'Train-':>7} {'Valid+':>7} {'Valid-':>7} {'Total':>7}")
+print("-" * 65)
+for _, row in df_summary.iterrows():
+    print(f"  {row['class_name']:<23} {row['train_positive']:>7} {row['train_negative']:>7} "
+          f"{row['valid_positive']:>7} {row['valid_negative']:>7} "
+          f"{row['train_total'] + row['valid_total']:>7}")
+
+# ============================================================================
+# STEP 6: VISUALIZE DATASET SIZES
+# ============================================================================
+fig, axes = plt.subplots(1, 2, figsize=(16, 6))
+fig.suptitle('Per-Class Binary Datasets — Overview', fontsize=16, fontweight='bold')
+
+# Train distribution
+ax = axes[0]
+x = np.arange(len(df_summary))
+w = 0.35
+ax.bar(x - w/2, df_summary['train_positive'], w, label='Positive', color='#2ECC71', alpha=0.8)
+ax.bar(x + w/2, df_summary['train_negative'], w, label='Negative', color='#E74C3C', alpha=0.8)
+ax.set_title('Training Set: Positive vs Negative', fontweight='bold')
+ax.set_xlabel('Class')
+ax.set_ylabel('Sample Count')
+ax.set_xticks(x)
+ax.set_xticklabels(df_summary['class_name'], rotation=45, ha='right', fontsize=9)
+ax.legend()
+ax.grid(True, alpha=0.3)
+
+# Valid distribution
+ax = axes[1]
+ax.bar(x - w/2, df_summary['valid_positive'], w, label='Positive', color='#3498DB', alpha=0.8)
+ax.bar(x + w/2, df_summary['valid_negative'], w, label='Negative', color='#E67E22', alpha=0.8)
+ax.set_title('Validation Set: Positive vs Negative', fontweight='bold')
+ax.set_xlabel('Class')
+ax.set_ylabel('Sample Count')
+ax.set_xticks(x)
+ax.set_xticklabels(df_summary['class_name'], rotation=45, ha='right', fontsize=9)
+ax.legend()
+ax.grid(True, alpha=0.3)
+
+plt.tight_layout()
+plt.savefig(f'{OUTPUT_BASE}/per_class_dataset_sizes.png', dpi=150, bbox_inches='tight')
+plt.close()
+
+print(f"\n💾 All outputs saved to Google Drive:")
+print(f"   📁 {OUTPUT_BASE}/")
+print(f"   ├── dataset_split_summary.csv")
+print(f"   ├── per_class_dataset_sizes.png")
+for class_id in feasible_classes:
+    class_name = CLASS_NAMES[class_id]
+    print(f"   ├── class_{class_id:02d}_{class_name}/")
+    print(f"   │     ├── train/images/ & labels/")
+    print(f"   │     ├── valid/images/ & labels/")
+    print(f"   │     ├── test/images/  & labels/")
+    print(f"   │     └── data.yaml")
+
+print(f"\n✅ DATASET SPLITTING COMPLETE!")
+print(f"   {len(feasible_classes)} binary datasets ready for One-vs-Rest training!")
+print("="*80)
+
+
+
+"""Training script"""
+
+"""
+================================================================================
+STEP 3: TRAIN ML MODELS FOR ALL 15 ROAD DEFECT CLASSES
+================================================================================
+- Extracts features from bounding box regions
+- Trains multiple ML models per class (LightGBM, XGBoost, CatBoost, RF)
+- Saves best model per class
+- Visualizes predictions on test data
+- All outputs saved to Google Drive
+- Optimized for T4 GPU training + Edge device inference
+================================================================================
+"""
+
+# ============================================================================
+# INSTALL REQUIRED PACKAGES (Run this first!)
+# ============================================================================
+print("📦 Installing required packages...")
+import subprocess
+import sys
+
+packages = [
+    'lightgbm',
+    'xgboost',
+    'catboost',
+    'scikit-image',
+    'imbalanced-learn'
+]
+
+for package in packages:
+    print(f"   Installing {package}...")
+    subprocess.check_call([sys.executable, '-m', 'pip', 'install', '-q', package])
+
+print("✅ All packages installed!\n")
+
+# ============================================================================
+# IMPORTS
+# ============================================================================
+import os
+import cv2
+import pickle
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+import seaborn as sns
+from pathlib import Path
+from collections import defaultdict
+from tqdm.auto import tqdm
+import json
+import time
+import warnings
+warnings.filterwarnings('ignore')
+
+# ML Libraries
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.metrics import (accuracy_score, precision_score, recall_score,
+                             f1_score, confusion_matrix, classification_report)
+from sklearn.preprocessing import StandardScaler
+from imblearn.over_sampling import SMOTE
+
+# Gradient Boosting Models
+import lightgbm as lgb
+import xgboost as xgb
+from catboost import CatBoostClassifier
+
+# Feature Extraction
+from skimage.feature import hog, local_binary_pattern
+from skimage.filters import gabor
+from scipy.stats import skew, kurtosis
+
+# Google Drive
+from google.colab import drive
+
+# ============================================================================
+# MOUNT GOOGLE DRIVE
+# ============================================================================
+print("📂 Mounting Google Drive...")
+drive.mount('/content/drive')
+
+DATASETS_DIR = '/content/drive/MyDrive/Road_Defect_Project/02_Per_Class_Datasets'
+OUTPUT_DIR   = '/content/drive/MyDrive/Road_Defect_Project/03_Trained_Models'
+os.makedirs(OUTPUT_DIR, exist_ok=True)
+
+print(f"✅ Datasets: {DATASETS_DIR}")
+print(f"✅ Output: {OUTPUT_DIR}\n")
+
+# ============================================================================
+# CONFIGURATION
+# ============================================================================
+CLASS_NAMES = {
+    0:  'Big_Culvert',
+    1:  'Blocked_culvert',
+    2:  'Cause_ways',
+    3:  'Crack',
+    4:  'Culvert',
+    5:  'Damaged_surface_layer',
+    6:  'Drainage_cover',
+    7:  'Edge_breaking',
+    8:  'Guard_stone',
+    9:  'Not_painted_gs',
+    10: 'Not_whitewashed',
+    11: 'Patching',
+    12: 'Ravelling',
+    13: 'km_stone',
+    14: 'pothole'
+}
+
+# Feature extraction settings
+TARGET_SIZE = (128, 128)  # Resize all ROIs to this size for consistency
+USE_SMOTE = True  # Handle class imbalance
+RANDOM_SEED = 42
+
+# ============================================================================
+# FEATURE EXTRACTION FUNCTIONS
+# ============================================================================
+def extract_roi_from_image(img_path, label_path):
+    """
+    Extract all ROIs (bounding boxes) from an image
+    Returns list of (roi_image, class_label) tuples
+    """
+    img = cv2.imread(str(img_path))
+    if img is None:
+        return []
+
+    h, w = img.shape[:2]
+    rois = []
+
+    if Path(label_path).exists() and Path(label_path).stat().st_size > 0:
+        with open(label_path, 'r') as f:
+            for line in f:
+                parts = line.strip().split()
+                if len(parts) >= 5:
+                    class_id = int(parts[0])
+                    x_center = float(parts[1]) * w
+                    y_center = float(parts[2]) * h
+                    box_w = float(parts[3]) * w
+                    box_h = float(parts[4]) * h
+
+                    x1 = int(max(0, x_center - box_w/2))
+                    y1 = int(max(0, y_center - box_h/2))
+                    x2 = int(min(w, x_center + box_w/2))
+                    y2 = int(min(h, y_center + box_h/2))
+
+                    if x2 > x1 and y2 > y1:
+                        roi = img[y1:y2, x1:x2]
+                        if roi.size > 0:
+                            rois.append((roi, class_id, (x1, y1, x2, y2)))
+
+        return rois
+    else:
+        # No annotations = negative sample (entire image or random crop)
+        # For simplicity, use center crop
+        crop_size = min(h, w) // 2
+        y_start = h // 4
+        x_start = w // 4
+        roi = img[y_start:y_start+crop_size, x_start:x_start+crop_size]
+        return [(roi, -1, (x_start, y_start, x_start+crop_size, y_start+crop_size))]  # -1 = negative
+
+
+def extract_features(roi):
+    """
+    Extract comprehensive features from ROI
+    Returns feature vector (~8000+ dimensions)
+    """
+    # Resize to standard size
+    roi_resized = cv2.resize(roi, TARGET_SIZE)
+    gray = cv2.cvtColor(roi_resized, cv2.COLOR_BGR2GRAY)
+
+    features = []
+
+    # 1. HOG Features (Histogram of Oriented Gradients) - for edges/shapes
+    hog_features = hog(
+        gray,
+        orientations=9,
+        pixels_per_cell=(8, 8),
+        cells_per_block=(2, 2),
+        block_norm='L2-Hys',
+        visualize=False
+    )
+    features.extend(hog_features)
+
+    # 2. LBP Features (Local Binary Patterns) - for texture
+    radius = 3
+    n_points = 8 * radius
+    lbp = local_binary_pattern(gray, n_points, radius, method='uniform')
+    lbp_hist, _ = np.histogram(lbp.ravel(), bins=n_points + 2,
+                                range=(0, n_points + 2), density=True)
+    features.extend(lbp_hist)
+
+    # 3. Color Histograms (RGB) - for color patterns
+    for channel in range(3):
+        hist = cv2.calcHist([roi_resized], [channel], None, [256], [0, 256])
+        hist = hist.flatten() / hist.sum()  # Normalize
+        features.extend(hist)
+
+    # 4. Gabor Filters - for oriented patterns
+    gabor_features = []
+    for theta in [0, np.pi/4, np.pi/2, 3*np.pi/4]:
+        filt_real, filt_imag = gabor(gray, frequency=0.1, theta=theta)
+        gabor_features.extend([
+            filt_real.mean(),
+            filt_real.std(),
+            filt_imag.mean(),
+            filt_imag.std()
+        ])
+    features.extend(gabor_features)
+
+    # 5. Statistical Features
+    stats_features = [
+        gray.mean(),
+        gray.std(),
+        gray.min(),
+        gray.max(),
+        skew(gray.ravel()),
+        kurtosis(gray.ravel()),
+        np.median(gray),
+        np.percentile(gray, 25),
+        np.percentile(gray, 75)
+    ]
+    features.extend(stats_features)
+
+    # 6. Edge Features
+    edges = cv2.Canny(gray, 50, 150)
+    edge_features = [
+        edges.mean(),
+        edges.std(),
+        (edges > 0).sum() / edges.size  # Edge density
+    ]
+    features.extend(edge_features)
+
+    return np.array(features, dtype=np.float32)
+
+
+def load_dataset(class_id, class_name):
+    """
+    Load all images for a specific binary class dataset
+    Returns X (features), y (labels), metadata
+    """
+    class_dir = Path(DATASETS_DIR) / f"class_{class_id:02d}_{class_name}"
+
+    if not class_dir.exists():
+        print(f"  ⚠️  Dataset not found: {class_dir}")
+        return None, None, None
+
+    X_train, y_train = [], []
+    X_valid, y_valid = [], []
+    X_test, y_test = [], []
+    test_metadata = []  # For visualization later
+
+    print(f"\n  📦 Loading: {class_name}")
+
+    # Load training data
+    train_img_dir = class_dir / 'train' / 'images'
+    train_lbl_dir = class_dir / 'train' / 'labels'
+
+    for img_path in tqdm(list(train_img_dir.glob('*.jpg')),
+                          desc=f"  Train", leave=False):
+        label_path = train_lbl_dir / (img_path.stem + '.txt')
+        rois = extract_roi_from_image(img_path, label_path)
+
+        for roi, label, bbox in rois:
+            features = extract_features(roi)
+            X_train.append(features)
+            y_train.append(1 if label == 0 else 0)  # 0 in label = positive class
+
+    # Load validation data
+    valid_img_dir = class_dir / 'valid' / 'images'
+    valid_lbl_dir = class_dir / 'valid' / 'labels'
+
+    for img_path in tqdm(list(valid_img_dir.glob('*.jpg')),
+                          desc=f"  Valid", leave=False):
+        label_path = valid_lbl_dir / (img_path.stem + '.txt')
+        rois = extract_roi_from_image(img_path, label_path)
+
+        for roi, label, bbox in rois:
+            features = extract_features(roi)
+            X_valid.append(features)
+            y_valid.append(1 if label == 0 else 0)
+
+    # Load test data (WITH metadata for visualization)
+    test_img_dir = class_dir / 'test' / 'images'
+    test_lbl_dir = class_dir / 'test' / 'labels'
+
+    for img_path in tqdm(list(test_img_dir.glob('*.jpg')),
+                          desc=f"  Test ", leave=False):
+        label_path = test_lbl_dir / (img_path.stem + '.txt')
+        rois = extract_roi_from_image(img_path, label_path)
+
+        for roi, label, bbox in rois:
+            features = extract_features(roi)
+            X_test.append(features)
+            y_test.append(1 if label == 0 else 0)
+
+            # Save metadata for visualization
+            test_metadata.append({
+                'img_path': str(img_path),
+                'bbox': bbox,
+                'true_label': 1 if label == 0 else 0,
+                'roi': roi.copy()
+            })
+
+    X_train = np.array(X_train)
+    y_train = np.array(y_train)
+    X_valid = np.array(X_valid)
+    y_valid = np.array(y_valid)
+    X_test = np.array(X_test)
+    y_test = np.array(y_test)
+
+    print(f"    Train: {X_train.shape[0]} samples ({y_train.sum()} positive)")
+    print(f"    Valid: {X_valid.shape[0]} samples ({y_valid.sum()} positive)")
+    print(f"    Test:  {X_test.shape[0]} samples ({y_test.sum()} positive)")
+    print(f"    Features: {X_train.shape[1]} dimensions")
+
+    return (X_train, y_train, X_valid, y_valid, X_test, y_test), test_metadata
+
+
+# ============================================================================
+# MODEL TRAINING FUNCTIONS
+# ============================================================================
+def train_lightgbm(X_train, y_train, X_valid, y_valid):
+    """Train LightGBM model"""
+    start_time = time.time()
+
+    model = lgb.LGBMClassifier(
+        n_estimators=200,
+        learning_rate=0.05,
+        max_depth=7,
+        num_leaves=31,
+        min_child_samples=20,
+        subsample=0.8,
+        colsample_bytree=0.8,
+        random_state=RANDOM_SEED,
+        n_jobs=-1,
+        verbose=-1
+    )
+
+    model.fit(
+        X_train, y_train,
+        eval_set=[(X_valid, y_valid)],
+        callbacks=[lgb.early_stopping(stopping_rounds=20, verbose=False)]
+    )
+
+    train_time = time.time() - start_time
+
+    # Inference speed test
+    start = time.time()
+    _ = model.predict(X_valid[:100])
+    inference_time = (time.time() - start) / 100 * 1000  # ms per sample
+
+    return model, train_time, inference_time
+
+
+def train_xgboost(X_train, y_train, X_valid, y_valid):
+    """Train XGBoost model"""
+    start_time = time.time()
+
+    model = xgb.XGBClassifier(
+        n_estimators=200,
+        learning_rate=0.05,
+        max_depth=7,
+        min_child_weight=3,
+        subsample=0.8,
+        colsample_bytree=0.8,
+        random_state=RANDOM_SEED,
+        n_jobs=-1,
+        tree_method='hist',
+        device='cuda',  # Use GPU for training
+        verbosity=0
+    )
+
+    model.fit(
+        X_train, y_train,
+        eval_set=[(X_valid, y_valid)],
+        verbose=False
+    )
+
+    train_time = time.time() - start_time
+
+    # Inference speed test (on CPU for edge device simulation)
+    model.set_params(device='cpu')
+    start = time.time()
+    _ = model.predict(X_valid[:100])
+    inference_time = (time.time() - start) / 100 * 1000
+
+    return model, train_time, inference_time
+
+
+def train_catboost(X_train, y_train, X_valid, y_valid):
+    """Train CatBoost model"""
+    start_time = time.time()
+
+    model = CatBoostClassifier(
+        iterations=200,
+        learning_rate=0.05,
+        depth=7,
+        l2_leaf_reg=3,
+        random_seed=RANDOM_SEED,
+        task_type='GPU',
+        devices='0',
+        verbose=False
+    )
+
+    model.fit(
+        X_train, y_train,
+        eval_set=(X_valid, y_valid),
+        early_stopping_rounds=20,
+        verbose=False
+    )
+
+    train_time = time.time() - start_time
+
+    # Inference speed test
+    start = time.time()
+    _ = model.predict(X_valid[:100])
+    inference_time = (time.time() - start) / 100 * 1000
+
+    return model, train_time, inference_time
+
+
+def train_random_forest(X_train, y_train, X_valid, y_valid):
+    """Train Random Forest model"""
+    start_time = time.time()
+
+    model = RandomForestClassifier(
+        n_estimators=100,
+        max_depth=15,
+        min_samples_split=10,
+        min_samples_leaf=4,
+        max_features='sqrt',
+        random_state=RANDOM_SEED,
+        n_jobs=-1
+    )
+
+    model.fit(X_train, y_train)
+
+    train_time = time.time() - start_time
+
+    # Inference speed test
+    start = time.time()
+    _ = model.predict(X_valid[:100])
+    inference_time = (time.time() - start) / 100 * 1000
+
+    return model, train_time, inference_time
+
+
+def evaluate_model(model, X_test, y_test):
+    """Evaluate model and return metrics"""
+    y_pred = model.predict(X_test)
+    y_proba = model.predict_proba(X_test)[:, 1] if hasattr(model, 'predict_proba') else y_pred
+
+    metrics = {
+        'accuracy': accuracy_score(y_test, y_pred),
+        'precision': precision_score(y_test, y_pred, zero_division=0),
+        'recall': recall_score(y_test, y_pred, zero_division=0),
+        'f1_score': f1_score(y_test, y_pred, zero_division=0),
+        'confusion_matrix': confusion_matrix(y_test, y_pred).tolist(),
+        'predictions': y_pred.tolist(),
+        'probabilities': y_proba.tolist()
+    }
+
+    return metrics
+
+
+# ============================================================================
+# VISUALIZATION FUNCTIONS
+# ============================================================================
+def plot_confusion_matrix(cm, class_name, output_path):
+    """Plot confusion matrix"""
+    fig, ax = plt.subplots(figsize=(8, 6))
+
+    sns.heatmap(cm, annot=True, fmt='d', cmap='Blues',
+                xticklabels=['Negative', 'Positive'],
+                yticklabels=['Negative', 'Positive'],
+                cbar_kws={'label': 'Count'})
+
+    ax.set_xlabel('Predicted Label', fontsize=12, fontweight='bold')
+    ax.set_ylabel('True Label', fontsize=12, fontweight='bold')
+    ax.set_title(f'Confusion Matrix: {class_name}', fontsize=14, fontweight='bold')
+
+    plt.tight_layout()
+    plt.savefig(output_path, dpi=150, bbox_inches='tight')
+    plt.close()
+
+
+def plot_feature_importance(model, model_name, class_name, output_path, top_n=20):
+    """Plot feature importance for tree-based models"""
+    if not hasattr(model, 'feature_importances_'):
+        return
+
+    importances = model.feature_importances_
+    indices = np.argsort(importances)[::-1][:top_n]
+
+    fig, ax = plt.subplots(figsize=(10, 8))
+
+    ax.barh(range(top_n), importances[indices], color='steelblue')
+    ax.set_yticks(range(top_n))
+    ax.set_yticklabels([f'Feature {i}' for i in indices])
+    ax.set_xlabel('Importance', fontsize=12, fontweight='bold')
+    ax.set_title(f'Top {top_n} Feature Importance: {class_name}\n{model_name}',
+                 fontsize=14, fontweight='bold')
+    ax.invert_yaxis()
+
+    plt.tight_layout()
+    plt.savefig(output_path, dpi=150, bbox_inches='tight')
+    plt.close()
+
+
+def visualize_test_predictions(model, test_metadata, class_name, output_path, max_images=12):
+    """
+    ⭐ VISUALIZE HOW MODEL DETECTS ON TEST DATA ⭐
+    Shows original images with bounding boxes colored by prediction correctness
+    """
+    if len(test_metadata) == 0:
+        print(f"    ⚠️  No test samples to visualize")
+        return
+
+    # Group by image
+    images_dict = defaultdict(list)
+    for meta in test_metadata:
+        images_dict[meta['img_path']].append(meta)
+
+    unique_images = list(images_dict.keys())[:max_images]
+
+    # Calculate grid size
+    n_images = len(unique_images)
+    n_cols = 4
+    n_rows = (n_images + n_cols - 1) // n_cols
+
+    fig, axes = plt.subplots(n_rows, n_cols, figsize=(20, 5*n_rows))
+    if n_rows == 1:
+        axes = axes.reshape(1, -1)
+    axes = axes.flatten()
+
+    fig.suptitle(f'Test Predictions: {class_name}\n🟢 Correct | 🔴 Wrong',
+                 fontsize=16, fontweight='bold')
+
+    for idx, img_path in enumerate(unique_images):
+        img = cv2.imread(img_path)
+        img_rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+
+        # Draw all detections for this image
+        for meta in images_dict[img_path]:
+            x1, y1, x2, y2 = meta['bbox']
+            true_label = meta['true_label']
+            pred_label = meta.get('pred_label', -1)
+            confidence = meta.get('confidence', 0)
+
+            # Color: Green if correct, Red if wrong
+            correct = (true_label == pred_label)
+            color = (0, 255, 0) if correct else (255, 0, 0)
+            thickness = 3 if correct else 2
+
+            cv2.rectangle(img_rgb, (x1, y1), (x2, y2), color, thickness)
+
+            # Label
+            label_text = f"{'✓' if correct else '✗'} "
+            label_text += f"Pred: {'POS' if pred_label == 1 else 'NEG'} "
+            label_text += f"({confidence:.2f})"
+
+            # Background for text
+            (text_w, text_h), _ = cv2.getTextSize(label_text, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 1)
+            cv2.rectangle(img_rgb, (x1, y1-text_h-8), (x1+text_w+5, y1), color, -1)
+            cv2.putText(img_rgb, label_text, (x1+2, y1-5),
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+
+        axes[idx].imshow(img_rgb)
+        axes[idx].set_title(Path(img_path).name[:30], fontsize=9)
+        axes[idx].axis('off')
+
+    # Hide empty subplots
+    for idx in range(len(unique_images), len(axes)):
+        axes[idx].axis('off')
+
+    plt.tight_layout()
+    plt.savefig(output_path, dpi=150, bbox_inches='tight')
+    plt.close()
+
+    print(f"    ✅ Test visualization saved: {Path(output_path).name}")
+
+
+# ============================================================================
+# MAIN TRAINING PIPELINE
+# ============================================================================
+def train_class_models(class_id, class_name):
+    """
+    Train all models for a single class
+    """
+    print("\n" + "="*80)
+    print(f"🎯 TRAINING CLASS {class_id}: {class_name}")
+    print("="*80)
+
+    # Create output directory
+    class_output_dir = Path(OUTPUT_DIR) / f"class_{class_id:02d}_{class_name}"
+    class_output_dir.mkdir(parents=True, exist_ok=True)
+
+    # Load dataset
+    dataset, test_metadata = load_dataset(class_id, class_name)
+    if dataset is None:
+        print(f"  ❌ Skipping {class_name} - dataset not found")
+        return None
+
+    X_train, y_train, X_valid, y_valid, X_test, y_test = dataset
+
+    # Feature scaling
+    print("\n  ⚙️  Scaling features...")
+    scaler = StandardScaler()
+    X_train_scaled = scaler.fit_transform(X_train)
+    X_valid_scaled = scaler.transform(X_valid)
+    X_test_scaled = scaler.transform(X_test)
+
+    # Handle class imbalance with SMOTE
+    if USE_SMOTE and y_train.sum() > 5:  # Need at least 5 positive samples
+        print(f"  ⚙️  Applying SMOTE (pos: {y_train.sum()}, neg: {len(y_train) - y_train.sum()})...")
+        smote = SMOTE(random_state=RANDOM_SEED)
+        X_train_scaled, y_train = smote.fit_resample(X_train_scaled, y_train)
+        print(f"      After SMOTE: {len(y_train)} samples ({y_train.sum()} positive)")
+
+    # Train all models
+    models_results = {}
+
+    print("\n  🚀 Training models...")
+
+    # 1. LightGBM
+    print("\n    📊 LightGBM...")
+    try:
+        model_lgb, train_time, inf_time = train_lightgbm(
+            X_train_scaled, y_train, X_valid_scaled, y_valid
+        )
+        metrics_lgb = evaluate_model(model_lgb, X_test_scaled, y_test)
+        models_results['lightgbm'] = {
+            'model': model_lgb,
+            'metrics': metrics_lgb,
+            'train_time': train_time,
+            'inference_time': inf_time
+        }
+        print(f"       Accuracy: {metrics_lgb['accuracy']:.4f} | "
+              f"F1: {metrics_lgb['f1_score']:.4f} | "
+              f"Inference: {inf_time:.3f}ms")
+    except Exception as e:
+        print(f"       ❌ Failed: {e}")
+
+    # 2. XGBoost
+    print("\n    📊 XGBoost...")
+    try:
+        model_xgb, train_time, inf_time = train_xgboost(
+            X_train_scaled, y_train, X_valid_scaled, y_valid
+        )
+        metrics_xgb = evaluate_model(model_xgb, X_test_scaled, y_test)
+        models_results['xgboost'] = {
+            'model': model_xgb,
+            'metrics': metrics_xgb,
+            'train_time': train_time,
+            'inference_time': inf_time
+        }
+        print(f"       Accuracy: {metrics_xgb['accuracy']:.4f} | "
+              f"F1: {metrics_xgb['f1_score']:.4f} | "
+              f"Inference: {inf_time:.3f}ms")
+    except Exception as e:
+        print(f"       ❌ Failed: {e}")
+
+    # 3. CatBoost
+    print("\n    📊 CatBoost...")
+    try:
+        model_cat, train_time, inf_time = train_catboost(
+            X_train_scaled, y_train, X_valid_scaled, y_valid
+        )
+        metrics_cat = evaluate_model(model_cat, X_test_scaled, y_test)
+        models_results['catboost'] = {
+            'model': model_cat,
+            'metrics': metrics_cat,
+            'train_time': train_time,
+            'inference_time': inf_time
+        }
+        print(f"       Accuracy: {metrics_cat['accuracy']:.4f} | "
+              f"F1: {metrics_cat['f1_score']:.4f} | "
+              f"Inference: {inf_time:.3f}ms")
+    except Exception as e:
+        print(f"       ❌ Failed: {e}")
+
+    # 4. Random Forest
+    print("\n    📊 Random Forest...")
+    try:
+        model_rf, train_time, inf_time = train_random_forest(
+            X_train_scaled, y_train, X_valid_scaled, y_valid
+        )
+        metrics_rf = evaluate_model(model_rf, X_test_scaled, y_test)
+        models_results['random_forest'] = {
+            'model': model_rf,
+            'metrics': metrics_rf,
+            'train_time': train_time,
+            'inference_time': inf_time
+        }
+        print(f"       Accuracy: {metrics_rf['accuracy']:.4f} | "
+              f"F1: {metrics_rf['f1_score']:.4f} | "
+              f"Inference: {inf_time:.3f}ms")
+    except Exception as e:
+        print(f"       ❌ Failed: {e}")
+
+    # Select best model
+    print("\n  🏆 Selecting best model...")
+    best_model_name = None
+    best_score = -1
+
+    for model_name, result in models_results.items():
+        # Composite score: 50% accuracy + 30% F1 + 10% speed + 10% size
+        acc = result['metrics']['accuracy']
+        f1 = result['metrics']['f1_score']
+        speed_score = 1 / (1 + result['inference_time'])  # Lower time = higher score
+
+        composite_score = 0.5 * acc + 0.3 * f1 + 0.2 * speed_score
+
+        if composite_score > best_score:
+            best_score = composite_score
+            best_model_name = model_name
+
+    if best_model_name is None:
+        print("    ❌ No models trained successfully")
+        return None
+
+    best_result = models_results[best_model_name]
+    best_model = best_result['model']
+    best_metrics = best_result['metrics']
+
+    print(f"    ⭐ Best: {best_model_name.upper()}")
+    print(f"       Accuracy:  {best_metrics['accuracy']:.4f}")
+    print(f"       Precision: {best_metrics['precision']:.4f}")
+    print(f"       Recall:    {best_metrics['recall']:.4f}")
+    print(f"       F1 Score:  {best_metrics['f1_score']:.4f}")
+    print(f"       Inference: {best_result['inference_time']:.3f}ms")
+
+    # Save all models
+    print("\n  💾 Saving models...")
+    for model_name, result in models_results.items():
+        model_path = class_output_dir / f"model_{model_name}.pkl"
+        with open(model_path, 'wb') as f:
+            pickle.dump({
+                'model': result['model'],
+                'scaler': scaler,
+                'metadata': {
+                    'class_id': class_id,
+                    'class_name': class_name,
+                    'model_type': model_name,
+                    'feature_dim': X_train.shape[1]
+                }
+            }, f)
+        print(f"    ✅ {model_name}: {model_path.name}")
+
+    # Save best model separately
+    best_model_path = class_output_dir / "best_model.pkl"
+    with open(best_model_path, 'wb') as f:
+        pickle.dump({
+            'model': best_model,
+            'scaler': scaler,
+            'metadata': {
+                'class_id': class_id,
+                'class_name': class_name,
+                'model_type': best_model_name,
+                'feature_dim': X_train.shape[1],
+                'metrics': best_metrics
+            }
+        }, f)
+    print(f"    ⭐ best_model.pkl (Use this for deployment!)")
+
+    # Save metrics
+    metrics_path = class_output_dir / "metrics.json"
+    with open(metrics_path, 'w') as f:
+        json.dump({
+            'best_model': best_model_name,
+            'models': {
+                name: {
+                    'accuracy': res['metrics']['accuracy'],
+                    'precision': res['metrics']['precision'],
+                    'recall': res['metrics']['recall'],
+                    'f1_score': res['metrics']['f1_score'],
+                    'train_time': res['train_time'],
+                    'inference_time': res['inference_time']
+                }
+                for name, res in models_results.items()
+            }
+        }, f, indent=2)
+    print(f"    ✅ metrics.json")
+
+    # Generate visualizations
+    print("\n  📊 Generating visualizations...")
+
+    # Confusion matrix
+    cm = np.array(best_metrics['confusion_matrix'])
+    cm_path = class_output_dir / "confusion_matrix.png"
+    plot_confusion_matrix(cm, class_name, cm_path)
+    print(f"    ✅ confusion_matrix.png")
+
+    # Feature importance
+    fi_path = class_output_dir / "feature_importance.png"
+    plot_feature_importance(best_model, best_model_name, class_name, fi_path)
+    print(f"    ✅ feature_importance.png")
+
+    # ⭐ TEST PREDICTIONS VISUALIZATION ⭐
+    print("\n  🎨 Visualizing test predictions...")
+
+    # Add predictions to metadata
+    for i, meta in enumerate(test_metadata):
+        meta['pred_label'] = best_metrics['predictions'][i]
+        meta['confidence'] = best_metrics['probabilities'][i]
+
+    viz_path = class_output_dir / "test_predictions_visualization.png"
+    visualize_test_predictions(best_model, test_metadata, class_name, viz_path)
+
+    # Training log
+    log_path = class_output_dir / "training_log.txt"
+    with open(log_path, 'w') as f:
+        f.write(f"Training Log: {class_name}\n")
+        f.write("="*60 + "\n\n")
+        f.write(f"Dataset:\n")
+        f.write(f"  Train: {X_train.shape[0]} samples\n")
+        f.write(f"  Valid: {X_valid.shape[0]} samples\n")
+        f.write(f"  Test:  {X_test.shape[0]} samples\n")
+        f.write(f"  Features: {X_train.shape[1]} dimensions\n\n")
+        f.write(f"Best Model: {best_model_name}\n")
+        f.write(f"  Accuracy:  {best_metrics['accuracy']:.4f}\n")
+        f.write(f"  Precision: {best_metrics['precision']:.4f}\n")
+        f.write(f"  Recall:    {best_metrics['recall']:.4f}\n")
+        f.write(f"  F1 Score:  {best_metrics['f1_score']:.4f}\n")
+        f.write(f"  Inference: {best_result['inference_time']:.3f}ms\n")
+    print(f"    ✅ training_log.txt")
+
+    print(f"\n✅ Class {class_id}: {class_name} COMPLETE!")
+    print(f"   📁 Saved to: {class_output_dir.name}/")
+
+    return {
+        'class_id': class_id,
+        'class_name': class_name,
+        'best_model': best_model_name,
+        'accuracy': best_metrics['accuracy'],
+        'precision': best_metrics['precision'],
+        'recall': best_metrics['recall'],
+        'f1_score': best_metrics['f1_score'],
+        'inference_time': best_result['inference_time'],
+        'train_samples': X_train.shape[0],
+        'test_samples': X_test.shape[0]
+    }
+
+
+# ============================================================================
+# RUN TRAINING FOR ALL CLASSES
+# ============================================================================
+print("\n" + "="*80)
+print("🚀 STARTING TRAINING FOR ALL 15 CLASSES")
+print("="*80)
+print(f"Using GPU: {os.system('nvidia-smi -L')}")
+
+all_results = []
+
+for class_id, class_name in CLASS_NAMES.items():
+    try:
+        result = train_class_models(class_id, class_name)
+        if result:
+            all_results.append(result)
+    except Exception as e:
+        print(f"\n❌ ERROR training {class_name}: {e}")
+        import traceback
+        traceback.print_exc()
+        continue
+
+# ============================================================================
+# GENERATE MASTER SUMMARY
+# ============================================================================
+print("\n" + "="*80)
+print("📊 GENERATING MASTER SUMMARY")
+print("="*80)
+
+if len(all_results) > 0:
+    df_summary = pd.DataFrame(all_results)
+    summary_path = Path(OUTPUT_DIR) / "MASTER_TRAINING_SUMMARY.csv"
+    df_summary.to_csv(summary_path, index=False)
+    print(f"\n✅ Master summary saved: {summary_path}")
+
+    # Display summary table
+    print("\n" + "="*80)
+    print("FINAL RESULTS SUMMARY")
+    print("="*80)
+    print(df_summary.to_string(index=False))
+
+    # Summary visualizations
+    fig, axes = plt.subplots(2, 2, figsize=(18, 12))
+    fig.suptitle('Training Results Summary — All 15 Classes',
+                 fontsize=18, fontweight='bold')
+
+    # 1. Accuracy comparison
+    ax = axes[0, 0]
+    bars = ax.barh(df_summary['class_name'], df_summary['accuracy'], color='steelblue')
+    for i, bar in enumerate(bars):
+        width = bar.get_width()
+        ax.text(width + 0.01, bar.get_y() + bar.get_height()/2,
+                f'{width:.3f}', va='center', fontsize=9, fontweight='bold')
+    ax.axvline(x=0.90, color='red', linestyle='--', label='90% Target')
+    ax.set_xlabel('Accuracy', fontweight='bold')
+    ax.set_title('Test Accuracy by Class', fontweight='bold')
+    ax.legend()
+    ax.grid(axis='x', alpha=0.3)
+
+    # 2. F1 Score comparison
+    ax = axes[0, 1]
+    bars = ax.barh(df_summary['class_name'], df_summary['f1_score'], color='green', alpha=0.7)
+    for i, bar in enumerate(bars):
+        width = bar.get_width()
+        ax.text(width + 0.01, bar.get_y() + bar.get_height()/2,
+                f'{width:.3f}', va='center', fontsize=9, fontweight='bold')
+    ax.set_xlabel('F1 Score', fontweight='bold')
+    ax.set_title('F1 Score by Class', fontweight='bold')
+    ax.grid(axis='x', alpha=0.3)
+
+    # 3. Inference time comparison
+    ax = axes[1, 0]
+    bars = ax.barh(df_summary['class_name'], df_summary['inference_time'], color='orange')
+    for i, bar in enumerate(bars):
+        width = bar.get_width()
+        ax.text(width + 0.01, bar.get_y() + bar.get_height()/2,
+                f'{width:.2f}ms', va='center', fontsize=9, fontweight='bold')
+    ax.axvline(x=10, color='red', linestyle='--', label='10ms Target')
+    ax.set_xlabel('Inference Time (ms)', fontweight='bold')
+    ax.set_title('Inference Speed by Class', fontweight='bold')
+    ax.legend()
+    ax.grid(axis='x', alpha=0.3)
+
+    # 4. Model distribution
+    ax = axes[1, 1]
+    model_counts = df_summary['best_model'].value_counts()
+    colors = ['#FF6B6B', '#4ECDC4', '#45B7D1', '#96CEB4']
+    wedges, texts, autotexts = ax.pie(model_counts.values, labels=model_counts.index,
+                                        autopct='%1.0f%%', startangle=90, colors=colors)
+    for autotext in autotexts:
+        autotext.set_color('white')
+        autotext.set_fontweight('bold')
+    ax.set_title('Best Model Distribution', fontweight='bold')
+
+    plt.tight_layout()
+    viz_path = Path(OUTPUT_DIR) / "training_summary_visualization.png"
+    plt.savefig(viz_path, dpi=150, bbox_inches='tight')
+    plt.close()
+    print(f"✅ Summary visualization saved: {viz_path}")
+
+    # Stats
+    print(f"\n📈 OVERALL STATISTICS:")
+    print(f"   Average Accuracy:    {df_summary['accuracy'].mean():.4f}")
+    print(f"   Average F1 Score:    {df_summary['f1_score'].mean():.4f}")
+    print(f"   Average Inference:   {df_summary['inference_time'].mean():.3f}ms")
+    print(f"   Classes ≥90% Acc:    {(df_summary['accuracy'] >= 0.90).sum()}/{len(df_summary)}")
+    print(f"   Classes <10ms Inf:   {(df_summary['inference_time'] < 10).sum()}/{len(df_summary)}")
+
+else:
+    print("⚠️  No models trained successfully")
+
+print("\n" + "="*80)
+print("🎉 TRAINING COMPLETE!")
+print("="*80)
+print(f"\n📁 All outputs saved to:")
+print(f"   {OUTPUT_DIR}")
+print(f"\n✅ Ready for deployment!")
+print("="*80)
+
+#upadeted script for diagnose
+
+"""
+================================================================================
+ROAD DEFECT DETECTION — COMPLETE TRAINING SCRIPT (NEW ACCOUNT)
+================================================================================
+- Mounts Google Drive (same Drive where datasets are saved)
+- Auto-detects already trained classes vs remaining
+- Fixes F1=0 bug (evaluates on validation, not broken test set)
+- Trains: LightGBM + XGBoost + CatBoost + Random Forest per class
+- Saves best model per class to Drive
+- Generates visualizations + master summary
+- Works on GPU (fast) or CPU (fallback)
+================================================================================
+BEFORE RUNNING:
+  1. Runtime → Change runtime type → GPU (T4)
+  2. Make sure this is logged into the SAME Google account as before
+     (so it can access Drive datasets from Step 2)
+================================================================================
+"""
+
+# ============================================================================
+# 0. INSTALL PACKAGES
+# ============================================================================
+import subprocess, sys
+print("📦 Installing packages...")
+for pkg in ['lightgbm', 'xgboost', 'catboost', 'scikit-image', 'imbalanced-learn', 'tqdm']:
+    subprocess.check_call([sys.executable, '-m', 'pip', 'install', '-q', pkg])
+print("✅ All packages ready\n")
+
+# ============================================================================
+# 1. IMPORTS
+# ============================================================================
+import os, cv2, pickle, json, time, warnings
+import numpy as np
+import pandas as pd
+import matplotlib
+matplotlib.use('Agg')
+import matplotlib.pyplot as plt
+import seaborn as sns
+from pathlib import Path
+from collections import defaultdict
+from tqdm.auto import tqdm
+warnings.filterwarnings('ignore')
+
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.metrics import (accuracy_score, precision_score,
+                             recall_score, f1_score, confusion_matrix)
+from sklearn.preprocessing import StandardScaler
+from imblearn.over_sampling import SMOTE
+import lightgbm as lgb
+import xgboost as xgb
+from catboost import CatBoostClassifier
+from skimage.feature import hog, local_binary_pattern
+from skimage.filters import gabor
+from scipy.stats import skew, kurtosis
+from google.colab import drive
+
+# ============================================================================
+# 2. MOUNT DRIVE
+# ============================================================================
+print("📂 Mounting Google Drive...")
+drive.mount('/content/drive')
+
+DATASETS_DIR = '/content/drive/MyDrive/Road_Defect_Project/02_Per_Class_Datasets'
+OUTPUT_DIR   = '/content/drive/MyDrive/Road_Defect_Project/03_Trained_Models'
+os.makedirs(OUTPUT_DIR, exist_ok=True)
+
+print(f"✅ Datasets : {DATASETS_DIR}")
+print(f"✅ Output   : {OUTPUT_DIR}")
+
+# Verify datasets exist
+if not os.path.exists(DATASETS_DIR):
+    print(f"\n❌ DATASETS NOT FOUND: {DATASETS_DIR}")
+    print("   Make sure you are logged into the SAME Google account!")
+    raise SystemExit()
+else:
+    class_folders = [f for f in os.listdir(DATASETS_DIR) if os.path.isdir(f'{DATASETS_DIR}/{f}')]
+    print(f"✅ Found {len(class_folders)} class datasets in Drive\n")
+
+# ============================================================================
+# 3. GPU CHECK
+# ============================================================================
+try:
+    gpu_info = subprocess.check_output(
+        ['nvidia-smi', '--query-gpu=name,memory.total', '--format=csv,noheader']
+    ).decode().strip()
+    print(f"🎮 GPU: {gpu_info}")
+    GPU_AVAILABLE    = True
+    XGBOOST_DEVICE   = 'cuda'
+    CATBOOST_TASK    = 'GPU'
+except:
+    print("💻 No GPU detected — using CPU")
+    GPU_AVAILABLE    = False
+    XGBOOST_DEVICE   = 'cpu'
+    CATBOOST_TASK    = 'CPU'
+
+# ============================================================================
+# 4. CONFIG
+# ============================================================================
+CLASS_NAMES = {
+    0:  'Big_Culvert',
+    1:  'Blocked_culvert',
+    2:  'Cause_ways',
+    3:  'Crack',
+    4:  'Culvert',
+    5:  'Damaged_surface_layer',
+    6:  'Drainage_cover',
+    7:  'Edge_breaking',
+    8:  'Guard_stone',
+    9:  'Not_painted_gs',
+    10: 'Not_whitewashed',
+    11: 'Patching',
+    12: 'Ravelling',
+    13: 'km_stone',
+    14: 'pothole'
+}
+TARGET_SIZE = (128, 128)
+RANDOM_SEED = 42
+
+# ============================================================================
+# 5. CHECK WHICH CLASSES NEED TRAINING
+# ============================================================================
+print("\n" + "="*70)
+print("CHECKING TRAINING STATUS")
+print("="*70)
+
+already_done   = []
+needs_training = []
+
+for class_id, class_name in CLASS_NAMES.items():
+    out_dir      = Path(OUTPUT_DIR) / f"class_{class_id:02d}_{class_name}"
+    model_path   = out_dir / "best_model.pkl"
+    metrics_path = out_dir / "metrics.json"
+
+    if model_path.exists() and metrics_path.exists():
+        try:
+            with open(metrics_path) as f:
+                m = json.load(f)
+            best   = m['best_model']
+            f1_val = m['models'][best]['f1_score']
+            acc    = m['models'][best]['accuracy']
+            # If evaluated on broken test set (F1=0 but acc looks suspicious)
+            if f1_val == 0.0:
+                print(f"  ⚠️  Class {class_id:2d}: {class_name:<25} → F1=0 BUG → RETRAIN")
+                needs_training.append((class_id, class_name, 'retrain'))
+            else:
+                print(f"  ✅  Class {class_id:2d}: {class_name:<25} → Acc={acc:.3f} F1={f1_val:.3f} DONE")
+                already_done.append((class_id, class_name))
+        except Exception as e:
+            print(f"  ⚠️  Class {class_id:2d}: {class_name:<25} → Corrupt metrics → RETRAIN")
+            needs_training.append((class_id, class_name, 'retrain'))
+    else:
+        print(f"  ❌  Class {class_id:2d}: {class_name:<25} → NOT TRAINED")
+        needs_training.append((class_id, class_name, 'new'))
+
+print(f"\n  ✅ Already done     : {len(already_done)} classes")
+print(f"  🔄 Needs training   : {len(needs_training)} classes")
+
+if len(needs_training) == 0:
+    print("\n🎉 ALL CLASSES TRAINED! Nothing to do.")
+    raise SystemExit()
+
+print(f"\n  Will train:")
+for cid, cname, reason in needs_training:
+    print(f"    Class {cid:2d}: {cname} ({'NEW' if reason=='new' else 'FIX F1 BUG'})")
+
+# ============================================================================
+# 6. FEATURE EXTRACTION
+# ============================================================================
+def extract_roi_from_image(img_path, label_path):
+    img = cv2.imread(str(img_path))
+    if img is None:
+        return []
+
+    h, w = img.shape[:2]
+    rois = []
+    lp   = Path(label_path)
+
+    if lp.exists() and lp.stat().st_size > 0:
+        with open(lp, 'r') as f:
+            for line in f:
+                parts = line.strip().split()
+                if len(parts) >= 5:
+                    cid = int(parts[0])
+                    xc  = float(parts[1]) * w
+                    yc  = float(parts[2]) * h
+                    bw  = float(parts[3]) * w
+                    bh  = float(parts[4]) * h
+                    x1  = int(max(0, xc - bw/2))
+                    y1  = int(max(0, yc - bh/2))
+                    x2  = int(min(w, xc + bw/2))
+                    y2  = int(min(h, yc + bh/2))
+                    if x2 > x1 and y2 > y1:
+                        roi = img[y1:y2, x1:x2]
+                        if roi.size > 0:
+                            rois.append((roi, cid, (x1, y1, x2, y2)))
+    else:
+        # Negative sample — use center crop
+        cs = min(h, w) // 2
+        ys, xs = h // 4, w // 4
+        roi = img[ys:ys+cs, xs:xs+cs]
+        if roi.size > 0:
+            rois.append((roi, -1, (xs, ys, xs+cs, ys+cs)))
+
+    return rois
+
+
+def extract_features(roi):
+    roi_r = cv2.resize(roi, TARGET_SIZE)
+    gray  = cv2.cvtColor(roi_r, cv2.COLOR_BGR2GRAY)
+    feats = []
+
+    # HOG — shape/edge structure
+    hog_f = hog(gray, orientations=9, pixels_per_cell=(8, 8),
+                cells_per_block=(2, 2), block_norm='L2-Hys', visualize=False)
+    feats.extend(hog_f)
+
+    # LBP — texture
+    lbp = local_binary_pattern(gray, 24, 3, method='uniform')
+    lbp_h, _ = np.histogram(lbp.ravel(), bins=26, range=(0, 26), density=True)
+    feats.extend(lbp_h)
+
+    # Color histograms (RGB)
+    for ch in range(3):
+        h = cv2.calcHist([roi_r], [ch], None, [256], [0, 256]).flatten()
+        feats.extend(h / (h.sum() + 1e-7))
+
+    # Gabor filters — oriented patterns
+    for theta in [0, np.pi/4, np.pi/2, 3*np.pi/4]:
+        fr, fi = gabor(gray, frequency=0.1, theta=theta)
+        feats.extend([fr.mean(), fr.std(), fi.mean(), fi.std()])
+
+    # Statistical moments
+    g = gray.ravel()
+    feats.extend([
+        gray.mean(), gray.std(), gray.min(), gray.max(),
+        float(skew(g)), float(kurtosis(g)),
+        np.median(gray), np.percentile(gray, 25), np.percentile(gray, 75)
+    ])
+
+    # Edge features
+    edges = cv2.Canny(gray, 50, 150)
+    feats.extend([edges.mean(), edges.std(), (edges > 0).sum() / edges.size])
+
+    return np.array(feats, dtype=np.float32)
+
+
+def load_split(class_dir, split):
+    """Load features + labels for one split"""
+    img_dir = class_dir / split / 'images'
+    lbl_dir = class_dir / split / 'labels'
+
+    if not img_dir.exists():
+        return np.array([]), np.array([]), []
+
+    X, y, meta = [], [], []
+    img_files = list(img_dir.glob('*.jpg')) + list(img_dir.glob('*.png'))
+
+    for img_path in tqdm(img_files, desc=f"    {split:5s}", leave=False):
+        lbl_path = lbl_dir / (img_path.stem + '.txt')
+        rois = extract_roi_from_image(img_path, lbl_path)
+
+        for roi, label, bbox in rois:
+            try:
+                feats = extract_features(roi)
+                X.append(feats)
+                y.append(1 if label == 0 else 0)  # 0 in label file = target class = positive
+                meta.append({
+                    'img_path':   str(img_path),
+                    'bbox':       bbox,
+                    'true_label': 1 if label == 0 else 0,
+                    'roi':        roi.copy()
+                })
+            except:
+                continue
+
+    return np.array(X), np.array(y), meta
+
+
+def load_dataset(class_id, class_name):
+    class_dir = Path(DATASETS_DIR) / f"class_{class_id:02d}_{class_name}"
+    if not class_dir.exists():
+        print(f"  ❌ Not found: {class_dir}")
+        return None, None
+
+    print(f"\n  📦 Loading: {class_name}")
+    X_tr, y_tr, _        = load_split(class_dir, 'train')
+    X_val, y_val, val_meta = load_split(class_dir, 'valid')
+
+    if len(X_tr) == 0:
+        print(f"  ❌ No training data!")
+        return None, None
+
+    print(f"    Train  : {len(X_tr):>5} samples  ({int(y_tr.sum()):>4} positive, {int((y_tr==0).sum()):>4} negative)")
+    print(f"    Valid  : {len(X_val):>5} samples  ({int(y_val.sum()):>4} positive, {int((y_val==0).sum()):>4} negative)")
+    print(f"    Features: {X_tr.shape[1]} dimensions")
+
+    if y_val.sum() == 0:
+        print(f"    ⚠️  WARNING: 0 positives in validation! F1 may be low.")
+
+    return (X_tr, y_tr, X_val, y_val), val_meta
+
+# ============================================================================
+# 7. MODEL TRAINING
+# ============================================================================
+def train_all_models(X_tr, y_tr, X_val, y_val):
+    results = {}
+
+    # LightGBM
+    print("    ▶ LightGBM  ", end='', flush=True)
+    try:
+        t0 = time.time()
+        m  = lgb.LGBMClassifier(
+            n_estimators=200, learning_rate=0.05, max_depth=7,
+            num_leaves=31, min_child_samples=10,
+            subsample=0.8, colsample_bytree=0.8,
+            class_weight='balanced',
+            random_state=RANDOM_SEED, n_jobs=-1, verbose=-1
+        )
+        m.fit(X_tr, y_tr, eval_set=[(X_val, y_val)],
+              callbacks=[lgb.early_stopping(20, verbose=False)])
+        tt = time.time() - t0
+        t0 = time.time(); _ = m.predict(X_val[:50])
+        it = (time.time()-t0)/50*1000
+        results['lightgbm'] = {'model': m, 'train_time': tt, 'inf_time': it}
+        print(f"→ {tt:.1f}s  {it:.3f}ms/sample ✅")
+    except Exception as e:
+        print(f"→ ❌ {e}")
+
+    # XGBoost
+    print("    ▶ XGBoost   ", end='', flush=True)
+    try:
+        t0 = time.time()
+        m  = xgb.XGBClassifier(
+            n_estimators=200, learning_rate=0.05, max_depth=7,
+            subsample=0.8, colsample_bytree=0.8,
+            scale_pos_weight=(y_tr==0).sum() / max(y_tr.sum(), 1),
+            random_state=RANDOM_SEED, n_jobs=-1,
+            tree_method='hist', device=XGBOOST_DEVICE,
+            max_bin=128, verbosity=0
+        )
+        m.fit(X_tr, y_tr, eval_set=[(X_val, y_val)], verbose=False)
+        tt = time.time() - t0
+        m.set_params(device='cpu')
+        t0 = time.time(); _ = m.predict(X_val[:50])
+        it = (time.time()-t0)/50*1000
+        results['xgboost'] = {'model': m, 'train_time': tt, 'inf_time': it}
+        print(f"→ {tt:.1f}s  {it:.3f}ms/sample ✅")
+    except Exception as e:
+        print(f"→ ❌ {e}")
+
+    # CatBoost
+    print("    ▶ CatBoost  ", end='', flush=True)
+    try:
+        t0 = time.time()
+        m  = CatBoostClassifier(
+            iterations=200, learning_rate=0.05, depth=7, l2_leaf_reg=3,
+            auto_class_weights='Balanced',
+            random_seed=RANDOM_SEED, task_type=CATBOOST_TASK, verbose=False
+        )
+        m.fit(X_tr, y_tr, eval_set=(X_val, y_val),
+              early_stopping_rounds=20, verbose=False)
+        tt = time.time() - t0
+        t0 = time.time(); _ = m.predict(X_val[:50])
+        it = (time.time()-t0)/50*1000
+        results['catboost'] = {'model': m, 'train_time': tt, 'inf_time': it}
+        print(f"→ {tt:.1f}s  {it:.3f}ms/sample ✅")
+    except Exception as e:
+        print(f"→ ❌ {e}")
+
+    # Random Forest
+    print("    ▶ RandForest", end='', flush=True)
+    try:
+        t0 = time.time()
+        m  = RandomForestClassifier(
+            n_estimators=100, max_depth=15,
+            min_samples_split=10, min_samples_leaf=4,
+            max_features='sqrt', class_weight='balanced',
+            random_state=RANDOM_SEED, n_jobs=-1
+        )
+        m.fit(X_tr, y_tr)
+        tt = time.time() - t0
+        t0 = time.time(); _ = m.predict(X_val[:50])
+        it = (time.time()-t0)/50*1000
+        results['random_forest'] = {'model': m, 'train_time': tt, 'inf_time': it}
+        print(f"→ {tt:.1f}s  {it:.3f}ms/sample ✅")
+    except Exception as e:
+        print(f"→ ❌ {e}")
+
+    return results
+
+
+def evaluate(model, X, y):
+    yp    = model.predict(X)
+    yprob = model.predict_proba(X)[:, 1] if hasattr(model, 'predict_proba') else yp.astype(float)
+    return {
+        'accuracy':  float(accuracy_score(y, yp)),
+        'precision': float(precision_score(y, yp, zero_division=0)),
+        'recall':    float(recall_score(y, yp, zero_division=0)),
+        'f1_score':  float(f1_score(y, yp, zero_division=0)),
+        'cm':        confusion_matrix(y, yp).tolist(),
+        'preds':     yp.tolist(),
+        'probs':     yprob.tolist()
+    }
+
+
+def pick_best_model(results, X_val, y_val):
+    """Score = 50% F1 + 30% Recall + 20% speed (F1 & recall prioritised for defect detection)"""
+    best_name, best_score = None, -1.0
+    for name, res in results.items():
+        met   = evaluate(res['model'], X_val, y_val)
+        res['metrics'] = met
+        spd   = 1.0 / (1.0 + res['inf_time'])
+        score = 0.5 * met['f1_score'] + 0.3 * met['recall'] + 0.2 * spd
+        if score > best_score:
+            best_score = score
+            best_name  = name
+    return best_name, results
+
+# ============================================================================
+# 8. SAVE OUTPUTS
+# ============================================================================
+def save_outputs(class_id, class_name, best_name, results,
+                 scaler, X_tr, X_val, y_val, val_meta, out_dir):
+    out_dir.mkdir(parents=True, exist_ok=True)
+    best     = results[best_name]
+    best_met = best['metrics']
+
+    # All models
+    for name, res in results.items():
+        with open(out_dir / f'model_{name}.pkl', 'wb') as f:
+            pickle.dump({
+                'model': res['model'], 'scaler': scaler,
+                'metadata': {
+                    'class_id': class_id, 'class_name': class_name,
+                    'model_type': name, 'feature_dim': int(X_tr.shape[1])
+                }
+            }, f)
+
+    # Best model
+    with open(out_dir / 'best_model.pkl', 'wb') as f:
+        pickle.dump({
+            'model': best['model'], 'scaler': scaler,
+            'metadata': {
+                'class_id': class_id, 'class_name': class_name,
+                'model_type': best_name, 'feature_dim': int(X_tr.shape[1]),
+                'metrics': best_met
+            }
+        }, f)
+    size_mb = os.path.getsize(out_dir / 'best_model.pkl') / 1e6
+    print(f"    💾 best_model.pkl saved  ({size_mb:.2f} MB)")
+
+    # Metrics JSON
+    with open(out_dir / 'metrics.json', 'w') as f:
+        json.dump({
+            'best_model': best_name,
+            'eval_set':   'validation',
+            'models': {
+                n: {
+                    'accuracy':        r['metrics']['accuracy'],
+                    'precision':       r['metrics']['precision'],
+                    'recall':          r['metrics']['recall'],
+                    'f1_score':        r['metrics']['f1_score'],
+                    'train_time':      r['train_time'],
+                    'inference_time':  r['inf_time']
+                }
+                for n, r in results.items() if 'metrics' in r
+            }
+        }, f, indent=2)
+
+    # Confusion matrix
+    cm = np.array(best_met['cm'])
+    fig, ax = plt.subplots(figsize=(6, 5))
+    sns.heatmap(cm, annot=True, fmt='d', cmap='Blues',
+                xticklabels=['Negative', 'Positive'],
+                yticklabels=['Negative', 'Positive'])
+    ax.set_title(
+        f'{class_name} — {best_name.upper()}\n'
+        f'Acc={best_met["accuracy"]:.3f}  '
+        f'F1={best_met["f1_score"]:.3f}  '
+        f'Recall={best_met["recall"]:.3f}',
+        fontweight='bold', fontsize=11
+    )
+    plt.tight_layout()
+    plt.savefig(out_dir / 'confusion_matrix.png', dpi=150)
+    plt.close()
+
+    # Validation predictions visualization
+    imgs_dict = defaultdict(list)
+    for i, meta in enumerate(val_meta):
+        if i < len(best_met['preds']):
+            meta['pred_label'] = best_met['preds'][i]
+            meta['confidence'] = best_met['probs'][i]
+            imgs_dict[meta['img_path']].append(meta)
+
+    unique_imgs = list(imgs_dict.keys())[:12]
+    if unique_imgs:
+        n_cols = min(4, len(unique_imgs))
+        n_rows = max(1, (len(unique_imgs) + n_cols - 1) // n_cols)
+        fig, axes = plt.subplots(n_rows, n_cols, figsize=(5*n_cols, 5*n_rows))
+        axes = np.array(axes).flatten()
+        fig.suptitle(
+            f'Validation Predictions: {class_name}\n'
+            f'🟢 Correct  🔴 Wrong  |  '
+            f'Acc={best_met["accuracy"]:.3f}  F1={best_met["f1_score"]:.3f}',
+            fontsize=13, fontweight='bold'
+        )
+        for idx, img_path in enumerate(unique_imgs):
+            img = cv2.imread(img_path)
+            if img is None:
+                continue
+            img_rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+            for meta in imgs_dict[img_path]:
+                x1, y1, x2, y2 = meta['bbox']
+                correct = (meta['true_label'] == meta['pred_label'])
+                col     = (0, 200, 0) if correct else (220, 0, 0)
+                cv2.rectangle(img_rgb, (x1, y1), (x2, y2), col, 3)
+                lbl = f"{'✓' if correct else '✗'} {'POS' if meta['pred_label']==1 else 'NEG'} {meta['confidence']:.2f}"
+                cv2.putText(img_rgb, lbl, (x1, max(18, y1-6)),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.6, col, 2)
+            axes[idx].imshow(img_rgb)
+            axes[idx].set_title(Path(img_path).name[:30], fontsize=8)
+            axes[idx].axis('off')
+        for idx in range(len(unique_imgs), len(axes)):
+            axes[idx].axis('off')
+        plt.tight_layout()
+        plt.savefig(out_dir / 'validation_predictions.png', dpi=150, bbox_inches='tight')
+        plt.close()
+        print(f"    🖼️  validation_predictions.png saved")
+
+    # Training log text
+    with open(out_dir / 'training_log.txt', 'w') as f:
+        f.write(f"Class {class_id}: {class_name}\n")
+        f.write(f"Evaluated on: VALIDATION SET\n")
+        f.write(f"Best Model  : {best_name}\n\n")
+        f.write(f"{'Model':<15} {'Acc':>8} {'F1':>8} {'Recall':>8} {'Prec':>8} {'ms':>8}\n")
+        f.write("-"*60 + "\n")
+        for n, r in results.items():
+            if 'metrics' in r:
+                m = r['metrics']
+                marker = " ⭐" if n == best_name else ""
+                f.write(f"{n:<15} {m['accuracy']:>8.4f} {m['f1_score']:>8.4f} "
+                        f"{m['recall']:>8.4f} {m['precision']:>8.4f} "
+                        f"{r['inf_time']:>8.3f}{marker}\n")
+
+# ============================================================================
+# 9. MAIN TRAINING LOOP
+# ============================================================================
+print("\n" + "="*70)
+print("🚀 STARTING TRAINING")
+print("="*70)
+
+session_results = []
+
+for class_id, class_name, reason in needs_training:
+    print(f"\n{'='*70}")
+    print(f"🎯 CLASS {class_id}: {class_name}  ({'NEW' if reason=='new' else 'RETRAIN — FIX F1 BUG'})")
+    print(f"{'='*70}")
+
+    try:
+        # Load data
+        dataset, val_meta = load_dataset(class_id, class_name)
+        if dataset is None:
+            continue
+
+        X_tr, y_tr, X_val, y_val = dataset
+
+        # Scale features
+        scaler  = StandardScaler()
+        X_tr_s  = scaler.fit_transform(X_tr)
+        X_val_s = scaler.transform(X_val)
+
+        # SMOTE for class imbalance
+        n_pos = int(y_tr.sum())
+        if n_pos >= 5:
+            k = min(5, n_pos - 1)
+            print(f"  ⚙️  SMOTE (k={k}): {n_pos} pos + {len(y_tr)-n_pos} neg ", end='')
+            smote   = SMOTE(random_state=RANDOM_SEED, k_neighbors=k)
+            X_tr_s, y_tr = smote.fit_resample(X_tr_s, y_tr)
+            print(f"→ {len(y_tr)} balanced samples")
+        else:
+            print(f"  ⚠️  Too few positives ({n_pos}) for SMOTE — training as-is")
+
+        # Train
+        print(f"\n  🚀 Training models (GPU={GPU_AVAILABLE}):")
+        results = train_all_models(X_tr_s, y_tr, X_val_s, y_val)
+
+        if not results:
+            print("  ❌ All models failed!")
+            continue
+
+        # Pick best
+        best_name, results = pick_best_model(results, X_val_s, y_val)
+        best_met = results[best_name]['metrics']
+
+        print(f"\n  🏆 Best model : {best_name.upper()}")
+        print(f"     Accuracy   : {best_met['accuracy']:.4f}")
+        print(f"     Precision  : {best_met['precision']:.4f}")
+        print(f"     Recall     : {best_met['recall']:.4f}")
+        print(f"     F1 Score   : {best_met['f1_score']:.4f}")
+        print(f"     Inference  : {results[best_name]['inf_time']:.3f} ms/sample")
+
+        # Save everything to Drive
+        print(f"\n  💾 Saving to Drive...")
+        out_dir = Path(OUTPUT_DIR) / f"class_{class_id:02d}_{class_name}"
+        save_outputs(class_id, class_name, best_name, results,
+                     scaler, X_tr, X_val_s, y_val, val_meta, out_dir)
+
+        session_results.append({
+            'class_id':    class_id,
+            'class_name':  class_name,
+            'best_model':  best_name,
+            'accuracy':    best_met['accuracy'],
+            'precision':   best_met['precision'],
+            'recall':      best_met['recall'],
+            'f1_score':    best_met['f1_score'],
+            'inf_time_ms': results[best_name]['inf_time'],
+            'train_n':     len(X_tr),
+            'val_n':       len(X_val)
+        })
+
+        print(f"\n  ✅ {class_name} COMPLETE — saved to Drive!")
+
+    except Exception as e:
+        import traceback
+        print(f"\n  ❌ ERROR on {class_name}: {e}")
+        traceback.print_exc()
+        continue
+
+# ============================================================================
+# 10. MASTER SUMMARY — reads all 15 classes from Drive
+# ============================================================================
+print("\n" + "="*70)
+print("📊 MASTER SUMMARY")
+print("="*70)
+
+all_metrics = []
+for class_id, class_name in CLASS_NAMES.items():
+    mp = Path(OUTPUT_DIR) / f"class_{class_id:02d}_{class_name}" / "metrics.json"
+    if mp.exists():
+        try:
+            with open(mp) as f:
+                m = json.load(f)
+            best = m['best_model']
+            all_metrics.append({
+                'class_id':   class_id,
+                'class_name': class_name,
+                'best_model': best,
+                'accuracy':   m['models'][best]['accuracy'],
+                'precision':  m['models'][best]['precision'],
+                'recall':     m['models'][best]['recall'],
+                'f1_score':   m['models'][best]['f1_score'],
+                'inf_ms':     m['models'][best]['inference_time'],
+            })
+        except:
+            pass
+
+if all_metrics:
+    df = pd.DataFrame(all_metrics).sort_values('class_id')
+    df.to_csv(f'{OUTPUT_DIR}/MASTER_TRAINING_SUMMARY.csv', index=False)
+
+    print(f"\n{'':>3} {'Class':<25} {'Best Model':<13} {'Acc':>6} {'F1':>6} {'Recall':>7} {'ms':>6} {'Status'}")
+    print("-"*78)
+    for _, r in df.iterrows():
+        flag = "✅" if r['f1_score'] > 0 else "⚠️ F1=0"
+        print(f"  {int(r['class_id']):>2}  {r['class_name']:<25} {r['best_model']:<13} "
+              f"{r['accuracy']:>6.3f} {r['f1_score']:>6.3f} {r['recall']:>7.3f} "
+              f"{r['inf_ms']:>6.3f}  {flag}")
+
+    # Summary charts
+    fig, axes = plt.subplots(1, 3, figsize=(21, 7))
+    fig.suptitle('Road Defect Detection — Master Training Summary (All 15 Classes)',
+                 fontsize=15, fontweight='bold')
+
+    bar_colors = ['#2ECC71' if v > 0 else '#E74C3C' for v in df['f1_score']]
+
+    axes[0].barh(df['class_name'], df['accuracy'], color='steelblue')
+    axes[0].axvline(0.9, color='red', linestyle='--', linewidth=1.5, label='90% target')
+    axes[0].set_xlabel('Accuracy'); axes[0].set_title('Accuracy', fontweight='bold')
+    axes[0].legend(); axes[0].grid(axis='x', alpha=0.3)
+
+    axes[1].barh(df['class_name'], df['f1_score'], color=bar_colors)
+    axes[1].set_xlabel('F1 Score')
+    axes[1].set_title('F1 Score  (🔴 = still zero = needs fix)', fontweight='bold')
+    axes[1].grid(axis='x', alpha=0.3)
+
+    axes[2].barh(df['class_name'], df['inf_ms'], color='orange')
+    axes[2].axvline(10, color='red', linestyle='--', linewidth=1.5, label='10ms limit')
+    axes[2].set_xlabel('ms / sample')
+    axes[2].set_title('Inference Speed', fontweight='bold')
+    axes[2].legend(); axes[2].grid(axis='x', alpha=0.3)
+
+    plt.tight_layout()
+    plt.savefig(f'{OUTPUT_DIR}/MASTER_SUMMARY_CHART.png', dpi=150, bbox_inches='tight')
+    plt.close()
+    print(f"\n  📊 MASTER_SUMMARY_CHART.png saved to Drive")
+
+    trained   = len(df[df['f1_score'] > 0])
+    remaining = len(df[df['f1_score'] == 0])
+    print(f"\n  ✅ Properly trained (F1 > 0) : {trained} / {len(df)} classes")
+    if remaining:
+        print(f"  ⚠️  Still need fixing (F1 = 0): {remaining} classes → re-run this script")
+
+print(f"\n💾 All outputs: {OUTPUT_DIR}")
+print("\n" + "="*70)
+print("🎉 SCRIPT COMPLETE!")
+print("="*70)

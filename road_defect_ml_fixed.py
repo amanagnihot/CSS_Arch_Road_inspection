@@ -4135,3 +4135,1801 @@ print(f"\n💾 All outputs: {OUTPUT_DIR}")
 print("\n" + "="*70)
 print("🎉 SCRIPT COMPLETE!")
 print("="*70)
+
+11-02-26
+
+#remaining part
+
+"""
+================================================================================
+STEP 4: FIX MISSING LOGS + PERFORMANCE TEST — ALL 15 CLASSES
+================================================================================
+- Fixes missing training_log.txt for classes 8, 9, 14 (Drive sync bug)
+- Skips all already-done work
+- Tests all 15 models on validation data
+- Shows per-class performance + master summary
+- Saves all outputs to same 03_Trained_Models directory
+================================================================================
+"""
+
+import subprocess, sys
+print("📦 Installing packages...")
+for pkg in ['lightgbm', 'xgboost', 'catboost', 'scikit-image', 'tqdm']:
+    subprocess.check_call([sys.executable, '-m', 'pip', 'install', '-q', pkg])
+print("✅ Done\n")
+
+import os, cv2, pickle, json, time, warnings
+import numpy as np
+import pandas as pd
+import matplotlib
+matplotlib.use('Agg')
+import matplotlib.pyplot as plt
+import seaborn as sns
+from pathlib import Path
+from collections import defaultdict
+from tqdm.auto import tqdm
+warnings.filterwarnings('ignore')
+
+from sklearn.metrics import (accuracy_score, precision_score, recall_score,
+                             f1_score, confusion_matrix, classification_report)
+from skimage.feature import hog, local_binary_pattern
+from skimage.filters import gabor
+from scipy.stats import skew, kurtosis
+from google.colab import drive
+
+# ============================================================================
+# MOUNT DRIVE
+# ============================================================================
+drive.mount('/content/drive')
+
+OUTPUT_DIR   = '/content/drive/MyDrive/Road_Defect_Project/03_Trained_Models'
+DATASETS_DIR = '/content/drive/MyDrive/Road_Defect_Project/02_Per_Class_Datasets'
+
+CLASS_NAMES = {
+    0:  'Big_Culvert',        1:  'Blocked_culvert',
+    2:  'Cause_ways',         3:  'Crack',
+    4:  'Culvert',            5:  'Damaged_surface_layer',
+    6:  'Drainage_cover',     7:  'Edge_breaking',
+    8:  'Guard_stone',        9:  'Not_painted_gs',
+    10: 'Not_whitewashed',    11: 'Patching',
+    12: 'Ravelling',          13: 'km_stone',
+    14: 'pothole'
+}
+
+TARGET_SIZE = (128, 128)
+
+# ============================================================================
+# STEP 1: FIX MISSING TRAINING LOGS (classes 8, 9, 14)
+# ============================================================================
+print("=" * 70)
+print("STEP 1: FIXING MISSING TRAINING LOGS")
+print("=" * 70)
+
+for class_id, class_name in CLASS_NAMES.items():
+    out_dir      = Path(OUTPUT_DIR) / f"class_{class_id:02d}_{class_name}"
+    log_path     = out_dir / 'training_log.txt'
+    metrics_path = out_dir / 'metrics.json'
+
+    if not out_dir.exists():
+        print(f"  ❌ Class {class_id:2d}: {class_name:<25} → folder missing!")
+        continue
+
+    if log_path.exists():
+        print(f"  ✅ Class {class_id:2d}: {class_name:<25} → log OK")
+        continue
+
+    # Fix: create missing log from metrics.json
+    out_dir.mkdir(parents=True, exist_ok=True)
+    try:
+        with open(metrics_path) as f:
+            m = json.load(f)
+        best = m['best_model']
+        bm   = m['models'][best]
+
+        with open(log_path, 'w') as f:
+            f.write(f"Class {class_id}: {class_name}\n")
+            f.write(f"Evaluated on : VALIDATION SET\n")
+            f.write(f"Best Model   : {best}\n\n")
+            f.write(f"{'Model':<15} {'Acc':>8} {'F1':>8} {'Recall':>8} {'Prec':>8} {'ms':>8}\n")
+            f.write("-" * 60 + "\n")
+            for n, r in m['models'].items():
+                marker = " ⭐" if n == best else ""
+                f.write(f"{n:<15} {r['accuracy']:>8.4f} {r['f1_score']:>8.4f} "
+                        f"{r['recall']:>8.4f} {r['precision']:>8.4f} "
+                        f"{r['inference_time']:>8.3f}{marker}\n")
+
+        print(f"  🔧 Class {class_id:2d}: {class_name:<25} → log FIXED ✅")
+
+    except Exception as e:
+        print(f"  ❌ Class {class_id:2d}: {class_name:<25} → could not fix: {e}")
+
+# ============================================================================
+# FEATURE EXTRACTION (same as training — must match exactly)
+# ============================================================================
+def extract_roi_from_image(img_path, label_path):
+    img = cv2.imread(str(img_path))
+    if img is None:
+        return []
+    h, w = img.shape[:2]
+    rois = []
+    lp   = Path(label_path)
+
+    if lp.exists() and lp.stat().st_size > 0:
+        with open(lp) as f:
+            for line in f:
+                parts = line.strip().split()
+                if len(parts) >= 5:
+                    cid = int(parts[0])
+                    xc  = float(parts[1]) * w
+                    yc  = float(parts[2]) * h
+                    bw  = float(parts[3]) * w
+                    bh  = float(parts[4]) * h
+                    x1  = int(max(0, xc - bw/2))
+                    y1  = int(max(0, yc - bh/2))
+                    x2  = int(min(w, xc + bw/2))
+                    y2  = int(min(h, yc + bh/2))
+                    if x2 > x1 and y2 > y1:
+                        roi = img[y1:y2, x1:x2]
+                        if roi.size > 0:
+                            rois.append((roi, cid, (x1, y1, x2, y2)))
+    else:
+        cs = min(h, w) // 2
+        ys, xs = h // 4, w // 4
+        roi = img[ys:ys+cs, xs:xs+cs]
+        if roi.size > 0:
+            rois.append((roi, -1, (xs, ys, xs+cs, ys+cs)))
+    return rois
+
+
+def extract_features(roi):
+    roi_r = cv2.resize(roi, TARGET_SIZE)
+    gray  = cv2.cvtColor(roi_r, cv2.COLOR_BGR2GRAY)
+    feats = []
+
+    hog_f = hog(gray, orientations=9, pixels_per_cell=(8, 8),
+                cells_per_block=(2, 2), block_norm='L2-Hys', visualize=False)
+    feats.extend(hog_f)
+
+    lbp = local_binary_pattern(gray, 24, 3, method='uniform')
+    lbp_h, _ = np.histogram(lbp.ravel(), bins=26, range=(0, 26), density=True)
+    feats.extend(lbp_h)
+
+    for ch in range(3):
+        h = cv2.calcHist([roi_r], [ch], None, [256], [0, 256]).flatten()
+        feats.extend(h / (h.sum() + 1e-7))
+
+    for theta in [0, np.pi/4, np.pi/2, 3*np.pi/4]:
+        fr, fi = gabor(gray, frequency=0.1, theta=theta)
+        feats.extend([fr.mean(), fr.std(), fi.mean(), fi.std()])
+
+    g = gray.ravel()
+    feats.extend([gray.mean(), gray.std(), gray.min(), gray.max(),
+                  float(skew(g)), float(kurtosis(g)),
+                  np.median(gray), np.percentile(gray, 25), np.percentile(gray, 75)])
+
+    edges = cv2.Canny(gray, 50, 150)
+    feats.extend([edges.mean(), edges.std(), (edges > 0).sum() / edges.size])
+
+    return np.array(feats, dtype=np.float32)
+
+
+def load_validation_set(class_id, class_name):
+    """Load validation images fresh for testing"""
+    class_dir = Path(DATASETS_DIR) / f"class_{class_id:02d}_{class_name}"
+    img_dir   = class_dir / 'valid' / 'images'
+    lbl_dir   = class_dir / 'valid' / 'labels'
+
+    if not img_dir.exists():
+        return None, None, None
+
+    X, y, meta = [], [], []
+    img_files  = list(img_dir.glob('*.jpg')) + list(img_dir.glob('*.png'))
+
+    for img_path in tqdm(img_files, desc=f"  Loading {class_name}", leave=False):
+        lbl_path = lbl_dir / (img_path.stem + '.txt')
+        rois = extract_roi_from_image(img_path, lbl_path)
+        for roi, label, bbox in rois:
+            try:
+                feats = extract_features(roi)
+                X.append(feats)
+                y.append(1 if label == 0 else 0)
+                meta.append({
+                    'img_path':   str(img_path),
+                    'bbox':       bbox,
+                    'true_label': 1 if label == 0 else 0,
+                    'roi':        roi.copy()
+                })
+            except:
+                continue
+
+    if not X:
+        return None, None, None
+
+    return np.array(X), np.array(y), meta
+
+# ============================================================================
+# STEP 2: PERFORMANCE TEST — ALL 15 CLASSES
+# ============================================================================
+print("\n" + "=" * 70)
+print("STEP 2: PERFORMANCE TESTING ALL 15 MODELS")
+print("=" * 70)
+
+all_results = []
+
+for class_id, class_name in CLASS_NAMES.items():
+    model_path = Path(OUTPUT_DIR) / f"class_{class_id:02d}_{class_name}" / "best_model.pkl"
+
+    if not model_path.exists():
+        print(f"\n  ❌ Class {class_id}: {class_name} — model not found, skipping")
+        continue
+
+    print(f"\n  🔍 Testing Class {class_id}: {class_name}")
+
+    # Load model
+    with open(model_path, 'rb') as f:
+        pkg = pickle.load(f)
+    model   = pkg['model']
+    scaler  = pkg['scaler']
+    meta_info = pkg['metadata']
+
+    # Load validation data fresh
+    X_val, y_val, val_meta = load_validation_set(class_id, class_name)
+
+    if X_val is None:
+        print(f"     ⚠️  No validation data found")
+        continue
+
+    # Scale using saved scaler
+    X_val_s = scaler.transform(X_val)
+
+    # Run inference + time it
+    t0    = time.time()
+    y_pred = model.predict(X_val_s)
+    total_time = (time.time() - t0) * 1000  # ms
+    per_sample_ms = total_time / len(X_val_s)
+
+    y_proba = model.predict_proba(X_val_s)[:, 1] if hasattr(model, 'predict_proba') else y_pred.astype(float)
+
+    # Metrics
+    acc  = accuracy_score(y_val, y_pred)
+    prec = precision_score(y_val, y_pred, zero_division=0)
+    rec  = recall_score(y_val, y_pred, zero_division=0)
+    f1   = f1_score(y_val, y_pred, zero_division=0)
+    cm   = confusion_matrix(y_val, y_pred)
+
+    n_pos = int(y_val.sum())
+    n_neg = int((y_val == 0).sum())
+    tp = cm[1, 1] if cm.shape == (2, 2) else 0
+    fp = cm[0, 1] if cm.shape == (2, 2) else 0
+    fn = cm[1, 0] if cm.shape == (2, 2) else 0
+    tn = cm[0, 0] if cm.shape == (2, 2) else 0
+
+    model_size_mb = os.path.getsize(model_path) / 1e6
+
+    print(f"     Samples    : {len(X_val)} ({n_pos} positive, {n_neg} negative)")
+    print(f"     Accuracy   : {acc:.4f}  {'✅' if acc >= 0.90 else '⚠️ '}")
+    print(f"     Precision  : {prec:.4f}")
+    print(f"     Recall     : {rec:.4f}")
+    print(f"     F1 Score   : {f1:.4f}  {'✅' if f1 >= 0.85 else '⚠️ '}")
+    print(f"     TP={tp}  FP={fp}  TN={tn}  FN={fn}")
+    print(f"     Inference  : {per_sample_ms:.3f} ms/sample  {'✅' if per_sample_ms < 10 else '⚠️ '}")
+    print(f"     Model size : {model_size_mb:.2f} MB")
+    print(f"     Best model : {meta_info['model_type']}")
+
+    all_results.append({
+        'class_id':     class_id,
+        'class_name':   class_name,
+        'model_type':   meta_info['model_type'],
+        'n_val_samples': len(X_val),
+        'n_positive':   n_pos,
+        'n_negative':   n_neg,
+        'accuracy':     acc,
+        'precision':    prec,
+        'recall':       rec,
+        'f1_score':     f1,
+        'tp': tp, 'fp': fp, 'tn': tn, 'fn': fn,
+        'inf_ms':       per_sample_ms,
+        'model_size_mb': model_size_mb,
+        'acc_pass':     acc >= 0.90,
+        'f1_pass':      f1 >= 0.85,
+        'speed_pass':   per_sample_ms < 10,
+    })
+
+    # Save per-class prediction viz (overwrite if exists)
+    out_dir = Path(OUTPUT_DIR) / f"class_{class_id:02d}_{class_name}"
+    imgs_dict = defaultdict(list)
+    for i, meta in enumerate(val_meta):
+        meta['pred_label'] = int(y_pred[i])
+        meta['confidence'] = float(y_proba[i])
+        imgs_dict[meta['img_path']].append(meta)
+
+    unique_imgs = list(imgs_dict.keys())[:12]
+    if unique_imgs:
+        n_cols = min(4, len(unique_imgs))
+        n_rows = max(1, (len(unique_imgs) + n_cols - 1) // n_cols)
+        fig, axes = plt.subplots(n_rows, n_cols, figsize=(5*n_cols, 5*n_rows))
+        axes = np.array(axes).flatten()
+        fig.suptitle(
+            f'Performance Test: {class_name}  [{meta_info["model_type"].upper()}]\n'
+            f'Acc={acc:.3f}  F1={f1:.3f}  Recall={rec:.3f}  Prec={prec:.3f}',
+            fontsize=12, fontweight='bold'
+        )
+        for idx, img_path in enumerate(unique_imgs):
+            img = cv2.imread(img_path)
+            if img is None:
+                axes[idx].axis('off')
+                continue
+            img_rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+            for m in imgs_dict[img_path]:
+                x1, y1, x2, y2 = m['bbox']
+                correct = (m['true_label'] == m['pred_label'])
+                col = (0, 200, 0) if correct else (220, 0, 0)
+                cv2.rectangle(img_rgb, (x1, y1), (x2, y2), col, 3)
+                lbl = f"{'✓' if correct else '✗'} {'POS' if m['pred_label']==1 else 'NEG'} {m['confidence']:.2f}"
+                cv2.putText(img_rgb, lbl, (x1, max(18, y1-6)),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.55, col, 2)
+            axes[idx].imshow(img_rgb)
+            axes[idx].set_title(Path(img_path).name[:28], fontsize=8)
+            axes[idx].axis('off')
+        for idx in range(len(unique_imgs), len(axes)):
+            axes[idx].axis('off')
+        plt.tight_layout()
+        plt.savefig(out_dir / 'performance_test_visualization.png', dpi=150, bbox_inches='tight')
+        plt.close()
+
+# ============================================================================
+# STEP 3: MASTER SUMMARY TABLE + CHARTS
+# ============================================================================
+print("\n" + "=" * 70)
+print("STEP 3: MASTER PERFORMANCE SUMMARY")
+print("=" * 70)
+
+df = pd.DataFrame(all_results).sort_values('class_id').reset_index(drop=True)
+df.to_csv(f'{OUTPUT_DIR}/PERFORMANCE_TEST_SUMMARY.csv', index=False)
+
+# Print table
+print(f"\n{'ID':>3}  {'Class':<25} {'Model':<12} {'Acc':>6} {'F1':>6} {'Recall':>7} {'Prec':>7} {'ms':>6}  Status")
+print("-" * 85)
+for _, r in df.iterrows():
+    passes = all([r['acc_pass'], r['f1_pass'], r['speed_pass']])
+    status = "✅ PASS" if passes else "⚠️  REVIEW"
+    print(f"  {int(r['class_id']):>2}  {r['class_name']:<25} {r['model_type']:<12} "
+          f"{r['accuracy']:>6.3f} {r['f1_score']:>6.3f} {r['recall']:>7.3f} "
+          f"{r['precision']:>7.3f} {r['inf_ms']:>6.3f}  {status}")
+
+print("\n" + "-" * 85)
+avg_acc = df['accuracy'].mean()
+avg_f1  = df['f1_score'].mean()
+avg_ms  = df['inf_ms'].mean()
+print(f"  {'AVERAGE':<30} {avg_acc:>6.3f} {avg_f1:>6.3f} {'':>7} {'':>7} {avg_ms:>6.3f}")
+print(f"\n  ✅ Accuracy ≥ 90% : {df['acc_pass'].sum()}/{len(df)} classes")
+print(f"  ✅ F1 ≥ 85%       : {df['f1_pass'].sum()}/{len(df)} classes")
+print(f"  ✅ Speed < 10ms   : {df['speed_pass'].sum()}/{len(df)} classes")
+print(f"  📦 Total model size: {df['model_size_mb'].sum():.2f} MB across all 15 models")
+
+# ============================================================================
+# CHARTS
+# ============================================================================
+fig, axes = plt.subplots(2, 2, figsize=(20, 14))
+fig.suptitle('Road Defect Detection — Performance Test Results (All 15 Classes)',
+             fontsize=16, fontweight='bold')
+
+# 1. Accuracy
+ax = axes[0, 0]
+colors = ['#2ECC71' if v else '#E74C3C' for v in df['acc_pass']]
+bars = ax.barh(df['class_name'], df['accuracy'], color=colors)
+ax.axvline(0.90, color='red', linestyle='--', linewidth=2, label='90% target')
+for bar, val in zip(bars, df['accuracy']):
+    ax.text(min(val + 0.005, 1.02), bar.get_y() + bar.get_height()/2,
+            f'{val:.3f}', va='center', fontsize=9, fontweight='bold')
+ax.set_xlim(0, 1.1)
+ax.set_title('Accuracy per Class', fontweight='bold', fontsize=13)
+ax.set_xlabel('Accuracy')
+ax.legend(); ax.grid(axis='x', alpha=0.3)
+
+# 2. F1 Score
+ax = axes[0, 1]
+colors = ['#2ECC71' if v else '#E74C3C' for v in df['f1_pass']]
+bars = ax.barh(df['class_name'], df['f1_score'], color=colors)
+ax.axvline(0.85, color='red', linestyle='--', linewidth=2, label='85% target')
+for bar, val in zip(bars, df['f1_score']):
+    ax.text(min(val + 0.005, 1.02), bar.get_y() + bar.get_height()/2,
+            f'{val:.3f}', va='center', fontsize=9, fontweight='bold')
+ax.set_xlim(0, 1.1)
+ax.set_title('F1 Score per Class', fontweight='bold', fontsize=13)
+ax.set_xlabel('F1 Score')
+ax.legend(); ax.grid(axis='x', alpha=0.3)
+
+# 3. Precision vs Recall scatter
+ax = axes[1, 0]
+scatter = ax.scatter(df['recall'], df['precision'],
+                     c=df['f1_score'], cmap='RdYlGn',
+                     s=150, zorder=5, vmin=0.5, vmax=1.0)
+for _, row in df.iterrows():
+    ax.annotate(row['class_name'][:10],
+                (row['recall'], row['precision']),
+                fontsize=7, ha='left', va='bottom',
+                xytext=(4, 4), textcoords='offset points')
+plt.colorbar(scatter, ax=ax, label='F1 Score')
+ax.axhline(0.85, color='gray', linestyle='--', alpha=0.5)
+ax.axvline(0.85, color='gray', linestyle='--', alpha=0.5)
+ax.set_xlabel('Recall', fontweight='bold')
+ax.set_ylabel('Precision', fontweight='bold')
+ax.set_title('Precision vs Recall', fontweight='bold', fontsize=13)
+ax.set_xlim(0, 1.1); ax.set_ylim(0, 1.1)
+ax.grid(alpha=0.3)
+
+# 4. Inference speed
+ax = axes[1, 1]
+colors = ['#2ECC71' if v else '#E74C3C' for v in df['speed_pass']]
+bars = ax.barh(df['class_name'], df['inf_ms'], color=colors)
+ax.axvline(10, color='red', linestyle='--', linewidth=2, label='10ms limit')
+for bar, val in zip(bars, df['inf_ms']):
+    ax.text(val + 0.01, bar.get_y() + bar.get_height()/2,
+            f'{val:.3f}ms', va='center', fontsize=9, fontweight='bold')
+ax.set_title('Inference Speed per Class', fontweight='bold', fontsize=13)
+ax.set_xlabel('ms / sample')
+ax.legend(); ax.grid(axis='x', alpha=0.3)
+
+plt.tight_layout()
+plt.savefig(f'{OUTPUT_DIR}/PERFORMANCE_TEST_CHART.png', dpi=150, bbox_inches='tight')
+plt.close()
+print(f"\n  📊 PERFORMANCE_TEST_CHART.png saved")
+
+# ============================================================================
+# FINAL STATUS
+# ============================================================================
+print("\n" + "=" * 70)
+print("🎯 FINAL STATUS")
+print("=" * 70)
+
+needs_attention = df[~(df['acc_pass'] & df['f1_pass'])]
+if len(needs_attention) == 0:
+    print("\n  🎉 ALL 15 CLASSES PASS accuracy AND F1 targets!")
+else:
+    print(f"\n  ⚠️  {len(needs_attention)} classes need attention:")
+    for _, r in needs_attention.iterrows():
+        issues = []
+        if not r['acc_pass']: issues.append(f"Acc={r['accuracy']:.3f} (<0.90)")
+        if not r['f1_pass']:  issues.append(f"F1={r['f1_score']:.3f} (<0.85)")
+        print(f"     Class {int(r['class_id']):2d}: {r['class_name']:<25} → {', '.join(issues)}")
+
+print(f"\n  Average Accuracy : {avg_acc:.4f}")
+print(f"  Average F1 Score : {avg_f1:.4f}")
+print(f"  Average Inference: {avg_ms:.4f} ms/sample")
+print(f"  Total model size : {df['model_size_mb'].sum():.2f} MB")
+
+print(f"\n💾 All outputs saved to: {OUTPUT_DIR}")
+print("   ├── PERFORMANCE_TEST_SUMMARY.csv")
+print("   ├── PERFORMANCE_TEST_CHART.png")
+print("   └── class_XX_*/performance_test_visualization.png")
+
+print("\n" + "=" * 70)
+print("✅ DONE — READY FOR INFERENCE PIPELINE!")
+print("=" * 70)
+
+
+
+"""#test"""
+
+"""
+================================================================================
+STEP 5: TEST SET EVALUATION — HOW MODELS DETECT ON UNSEEN IMAGES
+================================================================================
+- Loads each class best_model.pkl from Drive
+- Runs on TEST set images (never seen during training or validation)
+- Draws bounding boxes on real images showing detections
+- Green box = correctly detected defect
+- Red box   = missed or wrong prediction
+- Saves visual results + metrics to Drive
+================================================================================
+"""
+
+import subprocess, sys
+print("📦 Installing packages...")
+for pkg in ['lightgbm', 'xgboost', 'catboost', 'scikit-image', 'tqdm']:
+    subprocess.check_call([sys.executable, '-m', 'pip', 'install', '-q', pkg])
+print("✅ Done\n")
+
+import os, cv2, pickle, json, time, warnings
+import numpy as np
+import pandas as pd
+import matplotlib
+matplotlib.use('Agg')
+import matplotlib.pyplot as plt
+import seaborn as sns
+from pathlib import Path
+from collections import defaultdict
+from tqdm.auto import tqdm
+warnings.filterwarnings('ignore')
+
+from sklearn.metrics import (accuracy_score, precision_score,
+                             recall_score, f1_score, confusion_matrix)
+from skimage.feature import hog, local_binary_pattern
+from skimage.filters import gabor
+from scipy.stats import skew, kurtosis
+from google.colab import drive
+
+# ============================================================================
+# MOUNT DRIVE
+# ============================================================================
+drive.mount('/content/drive')
+
+OUTPUT_DIR   = '/content/drive/MyDrive/Road_Defect_Project/03_Trained_Models'
+DATASETS_DIR = '/content/drive/MyDrive/Road_Defect_Project/02_Per_Class_Datasets'
+TEST_VIZ_DIR = '/content/drive/MyDrive/Road_Defect_Project/05_Test_Results'
+os.makedirs(TEST_VIZ_DIR, exist_ok=True)
+
+CLASS_NAMES = {
+    0:  'Big_Culvert',        1:  'Blocked_culvert',
+    2:  'Cause_ways',         3:  'Crack',
+    4:  'Culvert',            5:  'Damaged_surface_layer',
+    6:  'Drainage_cover',     7:  'Edge_breaking',
+    8:  'Guard_stone',        9:  'Not_painted_gs',
+    10: 'Not_whitewashed',    11: 'Patching',
+    12: 'Ravelling',          13: 'km_stone',
+    14: 'pothole'
+}
+
+TARGET_SIZE = (128, 128)
+
+# ============================================================================
+# FEATURE EXTRACTION — same as training, must match exactly
+# ============================================================================
+def extract_roi_from_image(img_path, label_path):
+    img = cv2.imread(str(img_path))
+    if img is None:
+        return []
+    h, w = img.shape[:2]
+    rois = []
+    lp   = Path(label_path)
+
+    if lp.exists() and lp.stat().st_size > 0:
+        with open(lp) as f:
+            for line in f:
+                parts = line.strip().split()
+                if len(parts) >= 5:
+                    cid = int(parts[0])
+                    xc  = float(parts[1]) * w
+                    yc  = float(parts[2]) * h
+                    bw  = float(parts[3]) * w
+                    bh  = float(parts[4]) * h
+                    x1  = int(max(0, xc - bw/2))
+                    y1  = int(max(0, yc - bh/2))
+                    x2  = int(min(w, xc + bw/2))
+                    y2  = int(min(h, yc + bh/2))
+                    if x2 > x1 and y2 > y1:
+                        roi = img[y1:y2, x1:x2]
+                        if roi.size > 0:
+                            rois.append((roi, cid, (x1, y1, x2, y2)))
+    else:
+        cs = min(h, w) // 2
+        ys, xs = h // 4, w // 4
+        roi = img[ys:ys+cs, xs:xs+cs]
+        if roi.size > 0:
+            rois.append((roi, -1, (xs, ys, xs+cs, ys+cs)))
+    return rois
+
+
+def extract_features(roi):
+    roi_r = cv2.resize(roi, TARGET_SIZE)
+    gray  = cv2.cvtColor(roi_r, cv2.COLOR_BGR2GRAY)
+    feats = []
+
+    hog_f = hog(gray, orientations=9, pixels_per_cell=(8,8),
+                cells_per_block=(2,2), block_norm='L2-Hys', visualize=False)
+    feats.extend(hog_f)
+
+    lbp   = local_binary_pattern(gray, 24, 3, method='uniform')
+    lbp_h, _ = np.histogram(lbp.ravel(), bins=26, range=(0,26), density=True)
+    feats.extend(lbp_h)
+
+    for ch in range(3):
+        h = cv2.calcHist([roi_r], [ch], None, [256], [0,256]).flatten()
+        feats.extend(h / (h.sum() + 1e-7))
+
+    for theta in [0, np.pi/4, np.pi/2, 3*np.pi/4]:
+        fr, fi = gabor(gray, frequency=0.1, theta=theta)
+        feats.extend([fr.mean(), fr.std(), fi.mean(), fi.std()])
+
+    g = gray.ravel()
+    feats.extend([gray.mean(), gray.std(), gray.min(), gray.max(),
+                  float(skew(g)), float(kurtosis(g)),
+                  np.median(gray), np.percentile(gray, 25), np.percentile(gray, 75)])
+
+    edges = cv2.Canny(gray, 50, 150)
+    feats.extend([edges.mean(), edges.std(), (edges > 0).sum() / edges.size])
+
+    return np.array(feats, dtype=np.float32)
+
+
+# ============================================================================
+# LOAD TEST SET FOR A CLASS
+# ============================================================================
+def load_test_set(class_id, class_name):
+    class_dir = Path(DATASETS_DIR) / f"class_{class_id:02d}_{class_name}"
+    img_dir   = class_dir / 'test' / 'images'
+    lbl_dir   = class_dir / 'test' / 'labels'
+
+    if not img_dir.exists():
+        return None, None, None
+
+    img_files = list(img_dir.glob('*.jpg')) + list(img_dir.glob('*.png'))
+    if not img_files:
+        return None, None, None
+
+    X, y, meta = [], [], []
+
+    for img_path in img_files:
+        lbl_path = lbl_dir / (img_path.stem + '.txt')
+        rois = extract_roi_from_image(img_path, lbl_path)
+
+        for roi, label, bbox in rois:
+            try:
+                feats = extract_features(roi)
+                X.append(feats)
+                y.append(1 if label == 0 else 0)
+                meta.append({
+                    'img_path':   str(img_path),
+                    'bbox':       bbox,
+                    'true_label': 1 if label == 0 else 0,
+                    'roi':        roi.copy()
+                })
+            except:
+                continue
+
+    if not X:
+        return None, None, None
+
+    return np.array(X), np.array(y), meta
+
+
+# ============================================================================
+# VISUALIZE DETECTIONS ON FULL IMAGE
+# ============================================================================
+def visualize_detections(class_name, meta, y_true, y_pred, y_proba,
+                          out_path, max_images=16):
+    """
+    Shows full images with colored bounding boxes:
+    🟢 Green solid   = True Positive  (correctly found defect)
+    🔴 Red solid     = False Negative (missed defect)
+    🟡 Yellow dashed = False Positive (false alarm)
+    ⬜ Gray          = True Negative  (correctly ignored)
+    """
+    # Group by image
+    imgs_dict = defaultdict(list)
+    for i, m in enumerate(meta):
+        m = m.copy()
+        m['pred_label'] = int(y_pred[i])
+        m['confidence'] = float(y_proba[i])
+        m['true_label'] = int(y_true[i])
+        imgs_dict[m['img_path']].append(m)
+
+    unique_imgs = list(imgs_dict.keys())[:max_images]
+    n = len(unique_imgs)
+    if n == 0:
+        return
+
+    n_cols = min(4, n)
+    n_rows = max(1, (n + n_cols - 1) // n_cols)
+
+    fig, axes = plt.subplots(n_rows, n_cols,
+                             figsize=(6 * n_cols, 5 * n_rows))
+    axes = np.array(axes).flatten()
+
+    tp = int(((y_pred == 1) & (y_true == 1)).sum())
+    fp = int(((y_pred == 1) & (y_true == 0)).sum())
+    fn = int(((y_pred == 0) & (y_true == 1)).sum())
+    tn = int(((y_pred == 0) & (y_true == 0)).sum())
+
+    fig.suptitle(
+        f'Test Set Detections: {class_name}\n'
+        f'🟢 TP={tp}  🔴 FN={fn}  🟡 FP={fp}  ⬜ TN={tn}  '
+        f'|  Acc={accuracy_score(y_true,y_pred):.3f}  '
+        f'F1={f1_score(y_true,y_pred,zero_division=0):.3f}  '
+        f'Recall={recall_score(y_true,y_pred,zero_division=0):.3f}',
+        fontsize=13, fontweight='bold'
+    )
+
+    for idx, img_path in enumerate(unique_imgs):
+        img = cv2.imread(img_path)
+        if img is None:
+            axes[idx].axis('off')
+            continue
+
+        img_rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+        h, w    = img.shape[:2]
+
+        for m in imgs_dict[img_path]:
+            x1, y1, x2, y2 = m['bbox']
+            tl = m['true_label']
+            pl = m['pred_label']
+            cf = m['confidence']
+
+            # Color coding
+            if tl == 1 and pl == 1:
+                # TRUE POSITIVE — found it correctly
+                color     = (0, 200, 0)
+                label_txt = f"✓ TP {cf:.2f}"
+                thickness = 3
+                linetype  = cv2.LINE_AA
+            elif tl == 1 and pl == 0:
+                # FALSE NEGATIVE — missed it
+                color     = (220, 0, 0)
+                label_txt = f"✗ MISSED {cf:.2f}"
+                thickness = 3
+                linetype  = cv2.LINE_AA
+            elif tl == 0 and pl == 1:
+                # FALSE POSITIVE — false alarm
+                color     = (220, 180, 0)
+                label_txt = f"! FP {cf:.2f}"
+                thickness = 2
+                linetype  = cv2.LINE_AA
+            else:
+                # TRUE NEGATIVE — correctly ignored
+                color     = (150, 150, 150)
+                label_txt = f"— TN"
+                thickness = 1
+                linetype  = cv2.LINE_AA
+
+            cv2.rectangle(img_rgb, (x1, y1), (x2, y2), color, thickness, linetype)
+
+            # Label background
+            font       = cv2.FONT_HERSHEY_SIMPLEX
+            font_scale = 0.55
+            (tw, th), _ = cv2.getTextSize(label_txt, font, font_scale, 2)
+            ty = max(th + 6, y1 - 2)
+            cv2.rectangle(img_rgb, (x1, ty - th - 6), (x1 + tw + 6, ty), color, -1)
+            cv2.putText(img_rgb, label_txt, (x1 + 3, ty - 3),
+                        font, font_scale, (255, 255, 255), 2, linetype)
+
+        axes[idx].imshow(img_rgb)
+        axes[idx].set_title(Path(img_path).name[:30], fontsize=8)
+        axes[idx].axis('off')
+
+    for idx in range(n, len(axes)):
+        axes[idx].axis('off')
+
+    plt.tight_layout()
+    plt.savefig(out_path, dpi=150, bbox_inches='tight')
+    plt.close()
+
+
+# ============================================================================
+# MAIN — TEST ALL 15 CLASSES
+# ============================================================================
+print("=" * 70)
+print("STEP 2: TESTING ALL 15 MODELS ON TEST SET")
+print("=" * 70)
+
+all_results  = []
+skipped      = []
+
+for class_id, class_name in CLASS_NAMES.items():
+    model_path = Path(OUTPUT_DIR) / f"class_{class_id:02d}_{class_name}" / "best_model.pkl"
+
+    if not model_path.exists():
+        print(f"\n  ❌ Class {class_id}: {class_name} — model missing")
+        continue
+
+    print(f"\n  🔍 Class {class_id}: {class_name}")
+
+    # Load model + scaler
+    with open(model_path, 'rb') as f:
+        pkg = pickle.load(f)
+    model     = pkg['model']
+    scaler    = pkg['scaler']
+    meta_info = pkg['metadata']
+
+    # Load test data
+    X_test, y_test, test_meta = load_test_set(class_id, class_name)
+
+    if X_test is None:
+        print(f"     ⚠️  No test images found — skipping")
+        skipped.append(class_name)
+        continue
+
+    n_pos = int(y_test.sum())
+    n_neg = int((y_test == 0).sum())
+    print(f"     Test samples: {len(X_test)} ({n_pos} positive, {n_neg} negative)")
+
+    if n_pos == 0:
+        print(f"     ⚠️  0 positive samples in test set — detection viz will show TN only")
+
+    # Scale + predict
+    X_test_s = scaler.transform(X_test)
+
+    t0     = time.time()
+    y_pred = model.predict(X_test_s)
+    inf_ms = (time.time() - t0) / len(X_test_s) * 1000
+
+    y_proba = (model.predict_proba(X_test_s)[:, 1]
+               if hasattr(model, 'predict_proba')
+               else y_pred.astype(float))
+
+    # Metrics
+    acc  = accuracy_score(y_test, y_pred)
+    prec = precision_score(y_test, y_pred, zero_division=0)
+    rec  = recall_score(y_test, y_pred, zero_division=0)
+    f1   = f1_score(y_test, y_pred, zero_division=0)
+    cm   = confusion_matrix(y_test, y_pred)
+
+    tp = int(cm[1,1]) if cm.shape==(2,2) else 0
+    fp = int(cm[0,1]) if cm.shape==(2,2) else 0
+    fn = int(cm[1,0]) if cm.shape==(2,2) else 0
+    tn = int(cm[0,0]) if cm.shape==(2,2) else 0
+
+    print(f"     Accuracy  : {acc:.4f}  {'✅' if acc>=0.85 else '⚠️ '}")
+    print(f"     F1 Score  : {f1:.4f}  {'✅' if f1>=0.80 else '⚠️ '}")
+    print(f"     Recall    : {rec:.4f}")
+    print(f"     Precision : {prec:.4f}")
+    print(f"     TP={tp}  FP={fp}  TN={tn}  FN={fn}")
+    print(f"     Speed     : {inf_ms:.3f} ms/sample")
+
+    # Save detection visualization
+    viz_path = Path(TEST_VIZ_DIR) / f"class_{class_id:02d}_{class_name}_test_detections.png"
+    visualize_detections(class_name, test_meta, y_test, y_pred, y_proba, viz_path)
+    print(f"     🖼️  Detection image saved")
+
+    all_results.append({
+        'class_id':    class_id,
+        'class_name':  class_name,
+        'model_type':  meta_info['model_type'],
+        'n_test':      len(X_test),
+        'n_positive':  n_pos,
+        'n_negative':  n_neg,
+        'accuracy':    acc,
+        'precision':   prec,
+        'recall':      rec,
+        'f1_score':    f1,
+        'tp': tp, 'fp': fp, 'tn': tn, 'fn': fn,
+        'inf_ms':      inf_ms,
+    })
+
+# ============================================================================
+# SUMMARY
+# ============================================================================
+print("\n" + "=" * 70)
+print("TEST SET SUMMARY")
+print("=" * 70)
+
+if skipped:
+    print(f"\n  ⚠️  Skipped (no test images): {', '.join(skipped)}")
+    print(f"  These classes will be tested via the inference pipeline on new images\n")
+
+if all_results:
+    df = pd.DataFrame(all_results).sort_values('class_id')
+    df.to_csv(f'{TEST_VIZ_DIR}/test_set_results.csv', index=False)
+
+    print(f"\n{'ID':>3}  {'Class':<25} {'Acc':>6} {'F1':>6} {'Recall':>7} {'TP':>4} {'FP':>4} {'FN':>4} {'TN':>4}")
+    print("-" * 75)
+    for _, r in df.iterrows():
+        flag = "✅" if r['f1_score'] >= 0.80 else "⚠️ "
+        print(f"  {int(r['class_id']):>2}  {r['class_name']:<25} "
+              f"{r['accuracy']:>6.3f} {r['f1_score']:>6.3f} {r['recall']:>7.3f} "
+              f"{int(r['tp']):>4} {int(r['fp']):>4} {int(r['fn']):>4} {int(r['tn']):>4}  {flag}")
+
+    print(f"\n  Avg Accuracy : {df['accuracy'].mean():.4f}")
+    print(f"  Avg F1 Score : {df['f1_score'].mean():.4f}")
+    print(f"  Avg Recall   : {df['recall'].mean():.4f}")
+
+    # Summary chart
+    fig, axes = plt.subplots(1, 2, figsize=(16, 7))
+    fig.suptitle('Test Set Results — All Classes', fontsize=15, fontweight='bold')
+
+    colors = ['#2ECC71' if v >= 0.80 else '#E74C3C' for v in df['f1_score']]
+    axes[0].barh(df['class_name'], df['f1_score'], color=colors)
+    axes[0].axvline(0.80, color='red', linestyle='--', label='80% target')
+    axes[0].set_title('F1 Score on Test Set', fontweight='bold')
+    axes[0].set_xlabel('F1 Score')
+    axes[0].legend(); axes[0].grid(axis='x', alpha=0.3)
+    for i, v in enumerate(df['f1_score']):
+        axes[0].text(v + 0.005, i, f'{v:.3f}', va='center', fontsize=9)
+
+    # TP/FP/FN stacked bar
+    x = np.arange(len(df))
+    axes[1].bar(df['class_name'], df['tp'], label='TP (correct)', color='#2ECC71')
+    axes[1].bar(df['class_name'], df['fp'], bottom=df['tp'], label='FP (false alarm)', color='#F39C12')
+    axes[1].bar(df['class_name'], df['fn'],
+                bottom=df['tp'] + df['fp'], label='FN (missed)', color='#E74C3C')
+    axes[1].set_title('TP / FP / FN Breakdown', fontweight='bold')
+    axes[1].set_xlabel('Class')
+    axes[1].set_ylabel('Count')
+    axes[1].tick_params(axis='x', rotation=45)
+    axes[1].legend(); axes[1].grid(axis='y', alpha=0.3)
+
+    plt.tight_layout()
+    plt.savefig(f'{TEST_VIZ_DIR}/test_set_summary_chart.png', dpi=150, bbox_inches='tight')
+    plt.close()
+    print(f"\n  📊 Summary chart saved")
+
+print(f"\n💾 All test results saved to:")
+print(f"   {TEST_VIZ_DIR}/")
+print(f"   ├── test_set_results.csv")
+print(f"   ├── test_set_summary_chart.png")
+print(f"   └── class_XX_*_test_detections.png  (one per class)")
+print("\n" + "=" * 70)
+print("✅ TEST EVALUATION COMPLETE — Review images and share findings!")
+print("=" * 70)
+
+"""
+================================================================================
+DATASET INVENTORY — Complete count of images, annotations, splits per class
+================================================================================
+"""
+
+import os, json
+from pathlib import Path
+from collections import defaultdict
+from google.colab import drive
+
+drive.mount('/content/drive')
+
+DATASETS_DIR = '/content/drive/MyDrive/Road_Defect_Project/02_Per_Class_Datasets'
+
+CLASS_NAMES = {
+    0:  'Big_Culvert',        1:  'Blocked_culvert',
+    2:  'Cause_ways',         3:  'Crack',
+    4:  'Culvert',            5:  'Damaged_surface_layer',
+    6:  'Drainage_cover',     7:  'Edge_breaking',
+    8:  'Guard_stone',        9:  'Not_painted_gs',
+    10: 'Not_whitewashed',    11: 'Patching',
+    12: 'Ravelling',          13: 'km_stone',
+    14: 'pothole'
+}
+
+print("=" * 90)
+print("COMPLETE DATASET INVENTORY — PER CLASS, PER SPLIT")
+print("=" * 90)
+
+grand_total_imgs = 0
+grand_total_pos  = 0
+grand_total_neg  = 0
+
+for class_id, class_name in CLASS_NAMES.items():
+    class_dir = Path(DATASETS_DIR) / f"class_{class_id:02d}_{class_name}"
+
+    print(f"\n{'─'*90}")
+    print(f"  CLASS {class_id:2d}: {class_name}")
+    print(f"{'─'*90}")
+
+    class_total_imgs = 0
+    class_total_pos  = 0
+    class_total_neg  = 0
+
+    for split in ['train', 'valid', 'test']:
+        img_dir = class_dir / split / 'images'
+        lbl_dir = class_dir / split / 'labels'
+
+        if not img_dir.exists():
+            print(f"    {split:6s} → ❌ folder not found")
+            continue
+
+        img_files = list(img_dir.glob('*.jpg')) + list(img_dir.glob('*.png'))
+        n_imgs    = len(img_files)
+
+        # Count positive vs negative by checking label files
+        n_positive = 0
+        n_negative = 0
+        n_annotations = 0
+
+        for img_path in img_files:
+            lbl_path = lbl_dir / (img_path.stem + '.txt')
+            if lbl_path.exists() and lbl_path.stat().st_size > 0:
+                with open(lbl_path) as f:
+                    lines = [l.strip() for l in f if l.strip()]
+                if lines:
+                    n_positive    += 1
+                    n_annotations += len(lines)
+                else:
+                    n_negative += 1
+            else:
+                n_negative += 1
+
+        class_total_imgs += n_imgs
+        class_total_pos  += n_positive
+        class_total_neg  += n_negative
+
+        print(f"    {split:6s} → {n_imgs:4d} images  |  "
+              f"✅ {n_positive:4d} positive (has defect)  |  "
+              f"❌ {n_negative:4d} negative (no defect)  |  "
+              f"📌 {n_annotations:4d} annotations")
+
+    grand_total_imgs += class_total_imgs
+    grand_total_pos  += class_total_pos
+    grand_total_neg  += class_total_neg
+
+    print(f"\n    {'TOTAL':6s} → {class_total_imgs:4d} images  |  "
+          f"✅ {class_total_pos:4d} positive  |  "
+          f"❌ {class_total_neg:4d} negative")
+
+print(f"\n{'=' * 90}")
+print(f"  GRAND TOTAL → {grand_total_imgs} images  |  "
+      f"✅ {grand_total_pos} positive  |  ❌ {grand_total_neg} negative")
+print(f"{'=' * 90}")
+
+# ── answer the key question ──────────────────────────────────────────────────
+print(f"""
+KEY INSIGHT FOR TESTING:
+  • The test split has only 11 images — too few to evaluate properly
+  • Validation split has hundreds of images per class with real positives
+  • Validation was used for model SELECTION but NOT for training
+  • It is perfectly valid to use validation images for visual testing/demo
+  • For a true held-out test you would need fresh images not in the dataset
+""")
+
+#test evaluation
+
+"""
+================================================================================
+STEP 6: VISUAL DETECTION TEST — VALIDATION SET, POSITIVE IMAGES ONLY
+================================================================================
+- Shows ONLY images that contain the defect (positive samples)
+- 16 images per class
+- Each image shows the bounding box with detection result
+- Green  = model correctly detected the defect ✓
+- Red    = model missed the defect ✗
+- Saves one clean PNG per class + master summary to Drive
+================================================================================
+"""
+
+import subprocess, sys
+print("📦 Installing packages...")
+for pkg in ['lightgbm', 'xgboost', 'catboost', 'scikit-image', 'tqdm']:
+    subprocess.check_call([sys.executable, '-m', 'pip', 'install', '-q', pkg])
+print("✅ Done\n")
+
+import os, cv2, pickle, json, time, warnings
+import numpy as np
+import pandas as pd
+import matplotlib
+matplotlib.use('Agg')
+import matplotlib.pyplot as plt
+from pathlib import Path
+from collections import defaultdict
+from tqdm.auto import tqdm
+warnings.filterwarnings('ignore')
+
+from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score
+from skimage.feature import hog, local_binary_pattern
+from skimage.filters import gabor
+from scipy.stats import skew, kurtosis
+from google.colab import drive
+
+# ============================================================================
+# SETUP
+# ============================================================================
+drive.mount('/content/drive')
+
+MODELS_DIR   = '/content/drive/MyDrive/Road_Defect_Project/03_Trained_Models'
+DATASETS_DIR = '/content/drive/MyDrive/Road_Defect_Project/02_Per_Class_Datasets'
+OUTPUT_DIR   = '/content/drive/MyDrive/Road_Defect_Project/06_Visual_Detection_Test'
+os.makedirs(OUTPUT_DIR, exist_ok=True)
+
+CLASS_NAMES = {
+    0:  'Big_Culvert',        1:  'Blocked_culvert',
+    2:  'Cause_ways',         3:  'Crack',
+    4:  'Culvert',            5:  'Damaged_surface_layer',
+    6:  'Drainage_cover',     7:  'Edge_breaking',
+    8:  'Guard_stone',        9:  'Not_painted_gs',
+    10: 'Not_whitewashed',    11: 'Patching',
+    12: 'Ravelling',          13: 'km_stone',
+    14: 'pothole'
+}
+
+TARGET_SIZE    = (128, 128)
+IMAGES_PER_CLASS = 16   # show 16 per class
+
+# ============================================================================
+# FEATURE EXTRACTION — must match training exactly
+# ============================================================================
+def get_positive_rois(img_path, label_path):
+    """Return only the ROIs that ARE the target defect (label == 0 in binary label file)"""
+    img = cv2.imread(str(img_path))
+    if img is None:
+        return []
+    h, w = img.shape[:2]
+    rois = []
+    lp   = Path(label_path)
+
+    if not (lp.exists() and lp.stat().st_size > 0):
+        return []
+
+    with open(lp) as f:
+        for line in f:
+            parts = line.strip().split()
+            if len(parts) >= 5 and int(parts[0]) == 0:   # 0 = positive class in binary label
+                xc = float(parts[1]) * w
+                yc = float(parts[2]) * h
+                bw = float(parts[3]) * w
+                bh = float(parts[4]) * h
+                x1 = int(max(0, xc - bw/2))
+                y1 = int(max(0, yc - bh/2))
+                x2 = int(min(w, xc + bw/2))
+                y2 = int(min(h, yc + bh/2))
+                if x2 > x1 and y2 > y1:
+                    roi = img[y1:y2, x1:x2]
+                    if roi.size > 0:
+                        rois.append({
+                            'roi':      roi,
+                            'bbox':     (x1, y1, x2, y2),
+                            'img':      img,
+                            'img_path': str(img_path)
+                        })
+    return rois
+
+
+def extract_features(roi):
+    roi_r = cv2.resize(roi, TARGET_SIZE)
+    gray  = cv2.cvtColor(roi_r, cv2.COLOR_BGR2GRAY)
+    feats = []
+
+    hog_f = hog(gray, orientations=9, pixels_per_cell=(8,8),
+                cells_per_block=(2,2), block_norm='L2-Hys', visualize=False)
+    feats.extend(hog_f)
+
+    lbp = local_binary_pattern(gray, 24, 3, method='uniform')
+    lbp_h, _ = np.histogram(lbp.ravel(), bins=26, range=(0,26), density=True)
+    feats.extend(lbp_h)
+
+    for ch in range(3):
+        h = cv2.calcHist([roi_r], [ch], None, [256], [0,256]).flatten()
+        feats.extend(h / (h.sum() + 1e-7))
+
+    for theta in [0, np.pi/4, np.pi/2, 3*np.pi/4]:
+        fr, fi = gabor(gray, frequency=0.1, theta=theta)
+        feats.extend([fr.mean(), fr.std(), fi.mean(), fi.std()])
+
+    g = gray.ravel()
+    feats.extend([gray.mean(), gray.std(), gray.min(), gray.max(),
+                  float(skew(g)), float(kurtosis(g)),
+                  np.median(gray), np.percentile(gray, 25), np.percentile(gray, 75)])
+
+    edges = cv2.Canny(gray, 50, 150)
+    feats.extend([edges.mean(), edges.std(), (edges > 0).sum() / edges.size])
+
+    return np.array(feats, dtype=np.float32)
+
+
+# ============================================================================
+# MAIN LOOP
+# ============================================================================
+print("=" * 70)
+print("VISUAL DETECTION TEST — POSITIVE IMAGES ONLY (VALIDATION SET)")
+print("=" * 70)
+
+summary_rows = []
+
+for class_id, class_name in CLASS_NAMES.items():
+    print(f"\n{'─'*70}")
+    print(f"  CLASS {class_id:2d}: {class_name}")
+
+    model_path = Path(MODELS_DIR) / f"class_{class_id:02d}_{class_name}" / "best_model.pkl"
+    class_dir  = Path(DATASETS_DIR) / f"class_{class_id:02d}_{class_name}"
+    img_dir    = class_dir / 'valid' / 'images'
+    lbl_dir    = class_dir / 'valid' / 'labels'
+
+    if not model_path.exists():
+        print(f"  ❌ Model not found — skipping")
+        continue
+    if not img_dir.exists():
+        print(f"  ❌ Validation images not found — skipping")
+        continue
+
+    # Load model
+    with open(model_path, 'rb') as f:
+        pkg = pickle.load(f)
+    model     = pkg['model']
+    scaler    = pkg['scaler']
+    model_type = pkg['metadata']['model_type']
+
+    # Collect ALL positive ROIs from validation set
+    all_positive_imgs = []
+    img_files = list(img_dir.glob('*.jpg')) + list(img_dir.glob('*.png'))
+
+    for img_path in img_files:
+        lbl_path = lbl_dir / (img_path.stem + '.txt')
+        rois = get_positive_rois(img_path, lbl_path)
+        all_positive_imgs.extend(rois)
+
+    if not all_positive_imgs:
+        print(f"  ⚠️  No positive images in validation — skipping")
+        continue
+
+    print(f"  Found {len(all_positive_imgs)} positive ROIs in validation set")
+
+    # Limit to first 16 unique IMAGES (not ROIs) for clean display
+    # Group by image path first, then pick up to 16 images
+    by_image = defaultdict(list)
+    for item in all_positive_imgs:
+        by_image[item['img_path']].append(item)
+
+    selected_imgs = list(by_image.keys())[:IMAGES_PER_CLASS]
+    selected_rois = []
+    for ip in selected_imgs:
+        selected_rois.extend(by_image[ip])
+
+    print(f"  Showing {len(selected_imgs)} images ({len(selected_rois)} ROIs)")
+
+    # Extract features + predict
+    X = np.array([extract_features(r['roi']) for r in selected_rois])
+    X_s = scaler.transform(X)
+
+    y_pred  = model.predict(X_s)
+    y_proba = (model.predict_proba(X_s)[:, 1]
+               if hasattr(model, 'predict_proba') else y_pred.astype(float))
+
+    # Attach predictions back
+    for i, r in enumerate(selected_rois):
+        r['pred']  = int(y_pred[i])
+        r['conf']  = float(y_proba[i])
+
+    # Count TP / FN across all positives (not just selected)
+    all_X = np.array([extract_features(r['roi']) for r in all_positive_imgs])
+    all_X_s = scaler.transform(all_X)
+    all_pred = model.predict(all_X_s)
+    tp_all = int(all_pred.sum())
+    fn_all = len(all_pred) - tp_all
+    recall_all = tp_all / len(all_pred) if len(all_pred) > 0 else 0
+
+    print(f"  Full validation positive recall: {tp_all}/{len(all_pred)} = {recall_all:.3f}")
+
+    summary_rows.append({
+        'class_id':   class_id,
+        'class_name': class_name,
+        'model':      model_type,
+        'total_positives': len(all_positive_imgs),
+        'tp':         tp_all,
+        'fn':         fn_all,
+        'recall':     recall_all,
+    })
+
+    # ──────────────────────────────────────────────────────────────
+    # BUILD VISUALIZATION — 4 columns × 4 rows = 16 images
+    # ──────────────────────────────────────────────────────────────
+    n_cols = 4
+    n_rows = max(1, (len(selected_imgs) + n_cols - 1) // n_cols)
+
+    fig, axes = plt.subplots(n_rows, n_cols,
+                             figsize=(6 * n_cols, 5 * n_rows))
+    axes = np.array(axes).flatten()
+
+    # Title with stats
+    fig.suptitle(
+        f'Class {class_id}: {class_name}  [{model_type.upper()}]\n'
+        f'Validation Positive Images — '
+        f'Recall: {tp_all}/{len(all_positive_imgs)} = {recall_all:.1%}  |  '
+        f'🟢 Detected  🔴 Missed',
+        fontsize=14, fontweight='bold', y=1.01
+    )
+
+    # Group predictions back by image for drawing
+    pred_by_img = defaultdict(list)
+    for r in selected_rois:
+        pred_by_img[r['img_path']].append(r)
+
+    for idx, img_path in enumerate(selected_imgs):
+        img = cv2.imread(img_path)
+        if img is None:
+            axes[idx].axis('off')
+            continue
+
+        img_rgb  = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+        img_h, img_w = img.shape[:2]
+
+        detected_count = 0
+        missed_count   = 0
+
+        for r in pred_by_img[img_path]:
+            x1, y1, x2, y2 = r['bbox']
+            detected = r['pred'] == 1
+
+            if detected:
+                color = (0, 200, 0)       # Green — found it
+                icon  = '✓'
+                detected_count += 1
+            else:
+                color = (220, 30, 30)     # Red — missed
+                icon  = '✗'
+                missed_count += 1
+
+            # Draw box
+            cv2.rectangle(img_rgb, (x1, y1), (x2, y2), color, 3)
+
+            # Label with confidence
+            label = f"{icon} {r['conf']:.2f}"
+            font  = cv2.FONT_HERSHEY_SIMPLEX
+            fscale = 0.6
+            thickness = 2
+            (tw, th), _ = cv2.getTextSize(label, font, fscale, thickness)
+            # Background bar
+            ty = max(th + 8, y1 - 2)
+            cv2.rectangle(img_rgb,
+                          (x1, ty - th - 8),
+                          (x1 + tw + 8, ty),
+                          color, -1)
+            cv2.putText(img_rgb, label,
+                        (x1 + 4, ty - 4),
+                        font, fscale, (255, 255, 255), thickness)
+
+        axes[idx].imshow(img_rgb)
+
+        # Subplot title: image name + result
+        result_str = ""
+        if detected_count > 0 and missed_count == 0:
+            result_str = f"✅ All {detected_count} detected"
+        elif missed_count > 0 and detected_count == 0:
+            result_str = f"❌ All {missed_count} missed"
+        else:
+            result_str = f"✅{detected_count} ❌{missed_count}"
+
+        axes[idx].set_title(
+            f"{Path(img_path).name[:22]}\n{result_str}",
+            fontsize=8, fontweight='bold'
+        )
+        axes[idx].axis('off')
+
+    # Hide unused subplots
+    for idx in range(len(selected_imgs), len(axes)):
+        axes[idx].axis('off')
+
+    plt.tight_layout()
+    out_path = Path(OUTPUT_DIR) / f"class_{class_id:02d}_{class_name}.png"
+    plt.savefig(out_path, dpi=150, bbox_inches='tight')
+    plt.close()
+    print(f"  💾 Saved: class_{class_id:02d}_{class_name}.png")
+
+# ============================================================================
+# MASTER SUMMARY
+# ============================================================================
+print("\n" + "=" * 70)
+print("MASTER SUMMARY")
+print("=" * 70)
+
+df = pd.DataFrame(summary_rows).sort_values('class_id')
+df.to_csv(f'{OUTPUT_DIR}/visual_test_summary.csv', index=False)
+
+print(f"\n{'ID':>3}  {'Class':<25} {'Model':<12} {'Pos':>5} {'TP':>5} {'FN':>5} {'Recall':>8}")
+print("-" * 65)
+for _, r in df.iterrows():
+    flag = "✅" if r['recall'] >= 0.90 else "⚠️ "
+    print(f"  {int(r['class_id']):>2}  {r['class_name']:<25} {r['model']:<12} "
+          f"{int(r['total_positives']):>5} {int(r['tp']):>5} {int(r['fn']):>5} "
+          f"{r['recall']:>8.3f}  {flag}")
+
+print(f"\n  Avg Recall: {df['recall'].mean():.4f}")
+print(f"  Classes ≥ 90% recall: {(df['recall'] >= 0.90).sum()}/{len(df)}")
+
+# Summary chart
+fig, ax = plt.subplots(figsize=(12, 8))
+colors = ['#2ECC71' if v >= 0.90 else '#E74C3C' for v in df['recall']]
+bars = ax.barh(df['class_name'], df['recall'], color=colors)
+ax.axvline(0.90, color='red', linestyle='--', linewidth=2, label='90% target')
+for bar, val in zip(bars, df['recall']):
+    ax.text(min(val + 0.005, 1.02), bar.get_y() + bar.get_height()/2,
+            f'{val:.3f}', va='center', fontsize=10, fontweight='bold')
+ax.set_xlim(0, 1.12)
+ax.set_xlabel('Recall on Positive Validation Images', fontsize=12)
+ax.set_title('Detection Recall — All 15 Classes\n(Validation Positive Images Only)',
+             fontsize=14, fontweight='bold')
+ax.legend(fontsize=11)
+ax.grid(axis='x', alpha=0.3)
+plt.tight_layout()
+plt.savefig(f'{OUTPUT_DIR}/recall_summary_chart.png', dpi=150, bbox_inches='tight')
+plt.close()
+
+print(f"\n💾 All outputs saved to:")
+print(f"   {OUTPUT_DIR}/")
+print(f"   ├── recall_summary_chart.png")
+print(f"   ├── visual_test_summary.csv")
+print(f"   └── class_XX_<name>.png  ← 15 detection images")
+print("\n" + "=" * 70)
+print("✅ VISUAL TEST COMPLETE — Check the images in Drive!")
+print("=" * 70)
+
+#hog
+
+"""
+================================================================================
+STEP 7b: TEST SLIDING WINDOW ON DATASET IMAGES
+================================================================================
+- Picks sample images from our validation set (images with known defects)
+- Runs sliding window detector on them
+- Compares: Ground Truth boxes vs Detected boxes side by side
+- Green box  = Ground truth (where defect actually is)
+- Blue box   = What our sliding window detected
+- Shows how well the detector finds the right location
+================================================================================
+"""
+
+import subprocess, sys
+print("📦 Installing packages...")
+for pkg in ['lightgbm', 'xgboost', 'catboost', 'scikit-image', 'tqdm']:
+    subprocess.check_call([sys.executable, '-m', 'pip', 'install', '-q', pkg])
+print("✅ Done\n")
+
+import os, cv2, pickle, time, warnings
+import numpy as np
+import matplotlib
+matplotlib.use('Agg')
+import matplotlib.pyplot as plt
+from pathlib import Path
+from collections import defaultdict
+warnings.filterwarnings('ignore')
+
+from skimage.feature import hog, local_binary_pattern
+from skimage.filters import gabor
+from scipy.stats import skew, kurtosis
+from google.colab import drive
+
+drive.mount('/content/drive')
+
+MODELS_DIR   = '/content/drive/MyDrive/Road_Defect_Project/03_Trained_Models'
+DATASETS_DIR = '/content/drive/MyDrive/Road_Defect_Project/02_Per_Class_Datasets'
+OUTPUT_DIR   = '/content/drive/MyDrive/Road_Defect_Project/07_Sliding_Window_Results'
+os.makedirs(OUTPUT_DIR, exist_ok=True)
+
+CLASS_NAMES = {
+    0:  'Big_Culvert',        1:  'Blocked_culvert',
+    2:  'Cause_ways',         3:  'Crack',
+    4:  'Culvert',            5:  'Damaged_surface_layer',
+    6:  'Drainage_cover',     7:  'Edge_breaking',
+    8:  'Guard_stone',        9:  'Not_painted_gs',
+    10: 'Not_whitewashed',    11: 'Patching',
+    12: 'Ravelling',          13: 'km_stone',
+    14: 'pothole'
+}
+
+# Distinct color per class (BGR)
+CLASS_COLORS = {
+    0:  (255,100,0),   1:  (255,0,100),   2:  (0,200,100),
+    3:  (0,0,255),     4:  (200,0,200),   5:  (0,165,255),
+    6:  (0,255,255),   7:  (50,205,50),   8:  (255,215,0),
+    9:  (128,0,255),   10: (255,128,0),   11: (0,128,255),
+    12: (255,0,0),     13: (0,255,128),   14: (30,144,255)
+}
+
+TARGET_SIZE = (128, 128)
+
+# ============================================================================
+# SLIDING WINDOW SETTINGS
+# ============================================================================
+WINDOW_SIZES   = [128, 192, 256]
+STEP_SIZE      = 64
+CONF_THRESHOLD = 0.70
+NMS_THRESHOLD  = 0.30
+
+# How many sample images to test per class
+SAMPLES_PER_CLASS = 3
+
+# ============================================================================
+# LOAD ALL 15 MODELS
+# ============================================================================
+def load_all_models():
+    print("📂 Loading all 15 models...")
+    models = {}
+    for class_id, class_name in CLASS_NAMES.items():
+        path = Path(MODELS_DIR) / f"class_{class_id:02d}_{class_name}" / "best_model.pkl"
+        if path.exists():
+            with open(path, 'rb') as f:
+                pkg = pickle.load(f)
+            models[class_id] = {
+                'model':      pkg['model'],
+                'scaler':     pkg['scaler'],
+                'class_name': class_name,
+            }
+    print(f"  ✅ Loaded {len(models)}/15 models\n")
+    return models
+
+
+# ============================================================================
+# FEATURE EXTRACTION
+# ============================================================================
+def extract_features(roi):
+    roi_r = cv2.resize(roi, TARGET_SIZE)
+    gray  = cv2.cvtColor(roi_r, cv2.COLOR_BGR2GRAY)
+    feats = []
+
+    hog_f = hog(gray, orientations=9, pixels_per_cell=(8,8),
+                cells_per_block=(2,2), block_norm='L2-Hys', visualize=False)
+    feats.extend(hog_f)
+
+    lbp = local_binary_pattern(gray, 24, 3, method='uniform')
+    lbp_h, _ = np.histogram(lbp.ravel(), bins=26, range=(0,26), density=True)
+    feats.extend(lbp_h)
+
+    for ch in range(3):
+        h = cv2.calcHist([roi_r], [ch], None, [256], [0,256]).flatten()
+        feats.extend(h / (h.sum() + 1e-7))
+
+    for theta in [0, np.pi/4, np.pi/2, 3*np.pi/4]:
+        fr, fi = gabor(gray, frequency=0.1, theta=theta)
+        feats.extend([fr.mean(), fr.std(), fi.mean(), fi.std()])
+
+    g = gray.ravel()
+    feats.extend([gray.mean(), gray.std(), gray.min(), gray.max(),
+                  float(skew(g)), float(kurtosis(g)),
+                  np.median(gray), np.percentile(gray, 25), np.percentile(gray, 75)])
+
+    edges = cv2.Canny(gray, 50, 150)
+    feats.extend([edges.mean(), edges.std(), (edges > 0).sum() / edges.size])
+
+    return np.array(feats, dtype=np.float32)
+
+
+# ============================================================================
+# NMS
+# ============================================================================
+def nms(detections, iou_threshold=0.30):
+    if not detections:
+        return []
+
+    by_class = {}
+    for d in detections:
+        by_class.setdefault(d[4], []).append(d)
+
+    final = []
+    for cid, dets in by_class.items():
+        boxes  = np.array([[d[0],d[1],d[2],d[3]] for d in dets], dtype=np.float32)
+        scores = np.array([d[5] for d in dets], dtype=np.float32)
+        x1,y1,x2,y2 = boxes[:,0],boxes[:,1],boxes[:,2],boxes[:,3]
+        areas  = (x2-x1)*(y2-y1)
+        order  = scores.argsort()[::-1]
+        keep   = []
+
+        while order.size > 0:
+            i = order[0]; keep.append(i)
+            xx1 = np.maximum(x1[i], x1[order[1:]])
+            yy1 = np.maximum(y1[i], y1[order[1:]])
+            xx2 = np.minimum(x2[i], x2[order[1:]])
+            yy2 = np.minimum(y2[i], y2[order[1:]])
+            w   = np.maximum(0, xx2-xx1)
+            h   = np.maximum(0, yy2-yy1)
+            iou = (w*h) / (areas[i] + areas[order[1:]] - w*h + 1e-7)
+            order = order[np.where(iou <= iou_threshold)[0] + 1]
+
+        for k in keep:
+            final.append(dets[k])
+    return final
+
+
+# ============================================================================
+# SLIDING WINDOW DETECTION ON ONE IMAGE
+# ============================================================================
+def detect_image(img, models):
+    h, w = img.shape[:2]
+    windows = []
+
+    for win_size in WINDOW_SIZES:
+        for y in range(0, h - win_size + 1, STEP_SIZE):
+            for x in range(0, w - win_size + 1, STEP_SIZE):
+                roi = img[y:y+win_size, x:x+win_size]
+                if roi.size > 0:
+                    windows.append((x, y, x+win_size, y+win_size, roi))
+
+    if not windows:
+        return []
+
+    X = np.array([extract_features(w[4]) for w in windows])
+
+    raw = []
+    for class_id, m in models.items():
+        try:
+            X_s   = m['scaler'].transform(X)
+            proba = m['model'].predict_proba(X_s)[:, 1]
+            for i, (x1,y1,x2,y2,_) in enumerate(windows):
+                if proba[i] >= CONF_THRESHOLD:
+                    raw.append((x1,y1,x2,y2, class_id, float(proba[i])))
+        except:
+            continue
+
+    return nms(raw, NMS_THRESHOLD)
+
+
+# ============================================================================
+# READ GROUND TRUTH BOXES FROM YOLO LABEL FILE
+# ============================================================================
+def read_ground_truth(img_path, label_path, original_class_id):
+    """
+    In the per-class binary dataset:
+    label 0 = positive (target defect)
+    We map label 0 back to the original class_id for display
+    """
+    img = cv2.imread(str(img_path))
+    if img is None:
+        return [], img
+    h, w = img.shape[:2]
+    boxes = []
+
+    lp = Path(label_path)
+    if lp.exists() and lp.stat().st_size > 0:
+        with open(lp) as f:
+            for line in f:
+                parts = line.strip().split()
+                if len(parts) >= 5 and int(parts[0]) == 0:
+                    xc = float(parts[1]) * w
+                    yc = float(parts[2]) * h
+                    bw = float(parts[3]) * w
+                    bh = float(parts[4]) * h
+                    x1 = int(max(0, xc - bw/2))
+                    y1 = int(max(0, yc - bh/2))
+                    x2 = int(min(w, xc + bw/2))
+                    y2 = int(min(h, yc + bh/2))
+                    if x2 > x1 and y2 > y1:
+                        boxes.append((x1, y1, x2, y2))
+    return boxes, img
+
+
+# ============================================================================
+# MAIN — TEST ON DATASET IMAGES
+# ============================================================================
+print("=" * 70)
+print("SLIDING WINDOW TEST ON DATASET VALIDATION IMAGES")
+print("=" * 70)
+
+models = load_all_models()
+
+all_class_results = []
+
+for class_id, class_name in CLASS_NAMES.items():
+    img_dir = Path(DATASETS_DIR) / f"class_{class_id:02d}_{class_name}" / 'valid' / 'images'
+    lbl_dir = Path(DATASETS_DIR) / f"class_{class_id:02d}_{class_name}" / 'valid' / 'labels'
+
+    if not img_dir.exists():
+        continue
+
+    # Get positive images only (images that have this defect)
+    img_files = list(img_dir.glob('*.jpg')) + list(img_dir.glob('*.png'))
+    positive_imgs = []
+    for ip in img_files:
+        lp = lbl_dir / (ip.stem + '.txt')
+        if lp.exists() and lp.stat().st_size > 0:
+            positive_imgs.append(ip)
+
+    if not positive_imgs:
+        continue
+
+    # Pick SAMPLES_PER_CLASS images
+    samples = positive_imgs[:SAMPLES_PER_CLASS]
+
+    print(f"\n{'─'*70}")
+    print(f"  CLASS {class_id:2d}: {class_name}  ({len(positive_imgs)} positive val images available)")
+
+    class_detected = 0
+    class_total    = 0
+
+    # Build figure: 3 images × 2 columns (original | detected)
+    n_samples = len(samples)
+    fig, axes = plt.subplots(n_samples, 2,
+                             figsize=(14, 5 * n_samples))
+    if n_samples == 1:
+        axes = axes[np.newaxis, :]
+
+    fig.suptitle(
+        f'Class {class_id}: {class_name} — Sliding Window Detection\n'
+        f'🟢 Ground Truth Box   🔵 Detected by Model',
+        fontsize=13, fontweight='bold'
+    )
+
+    for row, img_path in enumerate(samples):
+        lbl_path = lbl_dir / (img_path.stem + '.txt')
+
+        # Ground truth
+        gt_boxes, img = read_ground_truth(img_path, lbl_path, class_id)
+        class_total += len(gt_boxes)
+
+        # Run detector
+        t0 = time.time()
+        detections = detect_image(img, models)
+        elapsed = time.time() - t0
+
+        # Count how many GT boxes were "hit" by a detection of correct class
+        hits = 0
+        color_map = CLASS_COLORS.get(class_id, (255,255,255))
+
+        for gt in gt_boxes:
+            gx1,gy1,gx2,gy2 = gt
+            for d in detections:
+                if d[4] == class_id:
+                    # Check IoU > 0.1 (loose — just checking if detector found the right area)
+                    ix1 = max(gx1, d[0]); iy1 = max(gy1, d[1])
+                    ix2 = min(gx2, d[2]); iy2 = min(gy2, d[3])
+                    iw  = max(0, ix2-ix1); ih = max(0, iy2-iy1)
+                    inter = iw * ih
+                    union = ((gx2-gx1)*(gy2-gy1) +
+                             (d[2]-d[0])*(d[3]-d[1]) - inter)
+                    if union > 0 and inter/union > 0.10:
+                        hits += 1
+                        break
+        class_detected += hits
+
+        # ── LEFT: Original + Ground Truth ──────────────────────────
+        left = cv2.cvtColor(img.copy(), cv2.COLOR_BGR2RGB)
+        for (x1,y1,x2,y2) in gt_boxes:
+            cv2.rectangle(left, (x1,y1),(x2,y2), (0,200,0), 3)
+            cv2.putText(left, f'GT: {class_name}',
+                        (x1, max(20,y1-6)),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0,200,0), 2)
+
+        axes[row, 0].imshow(left)
+        axes[row, 0].set_title(
+            f'Ground Truth  |  {img_path.name[:30]}',
+            fontsize=9, fontweight='bold'
+        )
+        axes[row, 0].axis('off')
+
+        # ── RIGHT: Detected boxes ───────────────────────────────────
+        right = cv2.cvtColor(img.copy(), cv2.COLOR_BGR2RGB)
+
+        # Also draw GT lightly for reference
+        for (x1,y1,x2,y2) in gt_boxes:
+            cv2.rectangle(right, (x1,y1),(x2,y2), (0,200,0), 2)
+
+        det_count = 0
+        for d in detections:
+            dx1,dy1,dx2,dy2 = d[0],d[1],d[2],d[3]
+            dc = CLASS_COLORS.get(d[4], (255,255,0))
+            dc_rgb = (dc[2], dc[1], dc[0])   # BGR→RGB
+            cv2.rectangle(right, (dx1,dy1),(dx2,dy2), dc_rgb, 3)
+            lbl = f"{d[5]:.2f} {CLASS_NAMES[d[4]]}"
+            cv2.putText(right, lbl, (dx1, max(20,dy1-6)),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, dc_rgb, 2)
+            det_count += 1
+
+        hit_str = f"✅ {hits}/{len(gt_boxes)} GT hit" if hits==len(gt_boxes) else f"⚠️ {hits}/{len(gt_boxes)} GT hit"
+        axes[row, 1].imshow(right)
+        axes[row, 1].set_title(
+            f'Detected: {det_count} box(es)  |  {hit_str}  |  {elapsed:.1f}s',
+            fontsize=9, fontweight='bold'
+        )
+        axes[row, 1].axis('off')
+
+        print(f"    {img_path.name[:35]:<35} GT={len(gt_boxes)}  "
+              f"Det={det_count}  Hit={hits}  {elapsed:.1f}s")
+
+    plt.tight_layout()
+    out_path = Path(OUTPUT_DIR) / f"sw_test_{class_id:02d}_{class_name}.png"
+    plt.savefig(str(out_path), dpi=130, bbox_inches='tight')
+    plt.close()
+
+    recall = class_detected / class_total if class_total > 0 else 0
+    print(f"    → Hit {class_detected}/{class_total} GT boxes  |  Recall={recall:.2f}")
+    print(f"    💾 Saved: sw_test_{class_id:02d}_{class_name}.png")
+
+    all_class_results.append({
+        'class_id':   class_id,
+        'class_name': class_name,
+        'gt_boxes':   class_total,
+        'hits':       class_detected,
+        'recall':     recall
+    })
+
+# ============================================================================
+# SUMMARY
+# ============================================================================
+print("\n" + "=" * 70)
+print("SLIDING WINDOW TEST SUMMARY")
+print("=" * 70)
+
+import pandas as pd
+df = pd.DataFrame(all_class_results).sort_values('class_id')
+
+print(f"\n{'ID':>3}  {'Class':<25} {'GT Boxes':>9} {'Hits':>6} {'Recall':>8}")
+print("-" * 55)
+for _, r in df.iterrows():
+    flag = "✅" if r['recall'] >= 0.50 else "⚠️ "
+    print(f"  {int(r['class_id']):>2}  {r['class_name']:<25} "
+          f"{int(r['gt_boxes']):>9} {int(r['hits']):>6} "
+          f"{r['recall']:>8.3f}  {flag}")
+
+print(f"\n  Avg Recall (localization): {df['recall'].mean():.3f}")
+print(f"\n  ⚠️  NOTE: Recall here means how many GT boxes the sliding")
+print(f"  window found at the right location (IoU > 0.10).")
+print(f"  This is harder than classification — detector must find")
+print(f"  the right location AND classify correctly.")
+
+print(f"\n💾 Results saved to: {OUTPUT_DIR}")
+print("=" * 70)
+print("✅ DONE! Review images in Drive to see Ground Truth vs Detected boxes")
+print("=" * 70)
+

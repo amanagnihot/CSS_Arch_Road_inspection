@@ -17584,3 +17584,2582 @@ if __name__ == '__main__':
 
     print(f"\nDone. Results at: {C.LOCAL_OUT}")
 
+#11-02-06|
+
+#again training
+
+#!/usr/bin/env python3
+"""
+================================================================================
+ROAD DEFECT DETECTION — COMPLETE PIPELINE
+================================================================================
+This script does EVERYTHING:
+  1. Downloads the dataset from your Colab environment
+  2. Extracts and analyzes the data
+  3. Fixes any dataset issues (corrupted images, invalid labels)
+  4. Validates train/val/test splits
+  5. Trains the model with all fixes applied
+  6. Evaluates on test set
+
+Just run this in Google Colab and it handles everything!
+================================================================================
+"""
+
+import os
+import json
+import shutil
+import zipfile
+from pathlib import Path
+from collections import defaultdict
+import warnings
+warnings.filterwarnings('ignore')
+
+# These will be imported after dataset validation
+import cv2
+import numpy as np
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.data import Dataset, DataLoader
+from tqdm import tqdm
+import matplotlib.pyplot as plt
+from PIL import Image, ImageDraw
+
+# ============================================================================
+# STEP 1: DATASET DOWNLOAD & EXTRACTION
+# ============================================================================
+
+def setup_dataset():
+    """Download, extract, and validate the dataset."""
+
+    print("=" * 80)
+    print("STEP 1: DATASET SETUP")
+    print("=" * 80)
+
+    dataset_zip = '/content/filtered_road_defects.zip'
+    extract_path = '/content/filtered_road_defects'
+
+    # Check if zip exists
+    if not os.path.exists(dataset_zip):
+        print(f"\n❌ ERROR: Dataset not found at {dataset_zip}")
+        print("\nPlease upload your dataset to Colab:")
+        print("1. Click the folder icon on the left")
+        print("2. Upload 'filtered_road_defects.zip' to /content/")
+        print("3. Re-run this script")
+        return None
+
+    print(f"\n✓ Found dataset: {dataset_zip}")
+    print(f"  Size: {os.path.getsize(dataset_zip) / (1024**2):.1f} MB")
+
+    # Extract if needed
+    if os.path.exists(extract_path):
+        print(f"\n✓ Dataset already extracted at: {extract_path}")
+    else:
+        print(f"\n→ Extracting to: {extract_path}")
+        with zipfile.ZipFile(dataset_zip, 'r') as zip_ref:
+            zip_ref.extractall('/content/')
+        print("✓ Extraction complete")
+
+    return extract_path
+
+# ============================================================================
+# STEP 2: DATASET ANALYSIS & VALIDATION
+# ============================================================================
+
+def analyze_dataset(base_path):
+    """Analyze dataset structure and statistics."""
+
+    print("\n" + "=" * 80)
+    print("STEP 2: DATASET ANALYSIS")
+    print("=" * 80)
+
+    base_path = Path(base_path)
+
+    # Expected structure
+    splits = ['train', 'valid', 'test']
+    stats = {}
+
+    for split in splits:
+        img_dir = base_path / split / 'images'
+        lbl_dir = base_path / split / 'labels'
+
+        if not img_dir.exists() or not lbl_dir.exists():
+            print(f"\n❌ ERROR: Missing {split} directory!")
+            print(f"   Expected: {img_dir}")
+            print(f"   Expected: {lbl_dir}")
+            continue
+
+        # Count files
+        images = list(img_dir.glob("*.jpg")) + list(img_dir.glob("*.png"))
+        labels = list(lbl_dir.glob("*.txt"))
+
+        print(f"\n{split.upper()}:")
+        print(f"  Images: {len(images)}")
+        print(f"  Labels: {len(labels)}")
+
+        stats[split] = {
+            'images': images,
+            'labels': labels,
+            'img_dir': img_dir,
+            'lbl_dir': lbl_dir
+        }
+
+    return stats
+
+# ============================================================================
+# STEP 3: DATASET CLEANING & VALIDATION
+# ============================================================================
+
+def clean_dataset(stats):
+    """Clean and validate the dataset."""
+
+    print("\n" + "=" * 80)
+    print("STEP 3: DATASET CLEANING")
+    print("=" * 80)
+
+    issues = defaultdict(list)
+    class_counts = defaultdict(int)
+
+    for split_name, split_data in stats.items():
+        print(f"\n→ Checking {split_name}...")
+
+        images = split_data['images']
+        img_dir = split_data['img_dir']
+        lbl_dir = split_data['lbl_dir']
+
+        corrupted_images = []
+        missing_labels = []
+        invalid_labels = []
+        box_count = 0
+
+        for img_path in tqdm(images, desc=f"  Validating {split_name}"):
+            # Check image can be loaded
+            try:
+                img = cv2.imread(str(img_path))
+                if img is None:
+                    corrupted_images.append(img_path)
+                    continue
+                h, w = img.shape[:2]
+            except Exception as e:
+                corrupted_images.append(img_path)
+                continue
+
+            # Check corresponding label exists
+            lbl_path = lbl_dir / (img_path.stem + '.txt')
+            if not lbl_path.exists():
+                missing_labels.append(img_path)
+                continue
+
+            # Validate label format
+            try:
+                valid_boxes = []
+                with open(lbl_path, 'r') as f:
+                    for line_num, line in enumerate(f, 1):
+                        parts = line.strip().split()
+                        if len(parts) < 5:
+                            continue
+
+                        cls, cx, cy, bw, bh = map(float, parts[:5])
+
+                        # Validate class
+                        if not (0 <= int(cls) <= 4):
+                            invalid_labels.append((lbl_path, f"Invalid class {cls}"))
+                            continue
+
+                        # Validate coordinates (must be 0-1)
+                        if not (0 < cx < 1 and 0 < cy < 1 and 0 < bw < 1 and 0 < bh < 1):
+                            invalid_labels.append((lbl_path, f"Invalid coords: {cx},{cy},{bw},{bh}"))
+                            continue
+
+                        valid_boxes.append(line)
+                        box_count += 1
+                        class_counts[int(cls)] += 1
+
+                # Rewrite label file with only valid boxes
+                if valid_boxes:
+                    with open(lbl_path, 'w') as f:
+                        f.writelines(valid_boxes)
+
+            except Exception as e:
+                invalid_labels.append((lbl_path, str(e)))
+
+        # Report issues
+        if corrupted_images:
+            print(f"  ⚠ Found {len(corrupted_images)} corrupted images - removing...")
+            for img_path in corrupted_images:
+                img_path.unlink()
+                issues[split_name].append(f"Removed corrupted: {img_path.name}")
+
+        if missing_labels:
+            print(f"  ⚠ Found {len(missing_labels)} images without labels - removing...")
+            for img_path in missing_labels:
+                img_path.unlink()
+                issues[split_name].append(f"Removed (no label): {img_path.name}")
+
+        if invalid_labels:
+            print(f"  ⚠ Found {len(invalid_labels)} invalid label entries - cleaned")
+            for lbl, reason in invalid_labels[:5]:  # Show first 5
+                issues[split_name].append(f"Cleaned {lbl.name}: {reason}")
+
+        print(f"  ✓ Valid boxes: {box_count}")
+
+    # Show class distribution
+    print("\n" + "=" * 80)
+    print("CLASS DISTRIBUTION:")
+    print("=" * 80)
+    class_names = ['Crack', 'Edge_breaking', 'Guard_stone', 'Ravelling', 'Pothole']
+    total = sum(class_counts.values())
+    for cls_id, name in enumerate(class_names):
+        count = class_counts[cls_id]
+        pct = (count / total * 100) if total > 0 else 0
+        print(f"  {cls_id}. {name:<20}: {count:4d} boxes ({pct:5.1f}%)")
+    print(f"\n  TOTAL: {total} boxes")
+
+    # Calculate objects per image
+    total_images = sum(len(s['images']) for s in stats.values())
+    avg_obj_per_img = total / total_images if total_images > 0 else 0
+    print(f"  Average objects per image: {avg_obj_per_img:.2f}")
+
+    # Save cleaning report
+    report_path = '/content/dataset_cleaning_report.json'
+    with open(report_path, 'w') as f:
+        json.dump({
+            'issues': dict(issues),
+            'class_distribution': dict(class_counts),
+            'total_boxes': total,
+            'total_images': total_images,
+            'avg_objects_per_image': avg_obj_per_img
+        }, f, indent=2)
+
+    print(f"\n✓ Cleaning report saved: {report_path}")
+
+    return class_counts, total
+
+# ============================================================================
+# CONFIG
+# ============================================================================
+
+class Config:
+    # Dataset paths (set after extraction)
+    TRAIN_IMG = None
+    TRAIN_LBL = None
+    VALID_IMG = None
+    VALID_LBL = None
+    TEST_IMG = None
+    TEST_LBL = None
+
+    # Classes
+    NUM_CLASSES = 5
+    CLASS_NAMES = ['Crack', 'Edge_breaking', 'Guard_stone', 'Ravelling', 'pothole']
+
+    # Input
+    IMG_SIZE = 640
+
+    # Training
+    BATCH_SIZE  = 8
+    NUM_EPOCHS  = 50
+    LR          = 0.01
+    MOMENTUM    = 0.937
+    WD          = 0.0005
+    PATIENCE    = 25
+    WARMUP_EPOCHS = 10
+
+    # Evaluation
+    IOU_THRESH  = 0.5
+    NMS_THRESH  = 0.4
+    CONF_THRESH = 0.05
+
+    # Output
+    LOCAL_OUT   = '/content/road_defect_output'
+    DRIVE_OUT   = '/content/drive/MyDrive/road_defect_output'
+
+C = Config
+
+# ============================================================================
+# OUTPUT SETUP
+# ============================================================================
+
+def setup_output():
+    os.makedirs(C.LOCAL_OUT, exist_ok=True)
+    drive_ok = os.path.exists('/content/drive/MyDrive')
+    if drive_ok:
+        os.makedirs(C.DRIVE_OUT, exist_ok=True)
+        print(f"  Local : {C.LOCAL_OUT}")
+        print(f"  Drive : {C.DRIVE_OUT}")
+    else:
+        print(f"  Local : {C.LOCAL_OUT}")
+        print(f"  Drive : not mounted")
+    return drive_ok
+
+def save_to_drive(local_path, drive_ok):
+    if drive_ok and os.path.exists(local_path):
+        dst = local_path.replace(C.LOCAL_OUT, C.DRIVE_OUT)
+        os.makedirs(os.path.dirname(dst), exist_ok=True)
+        shutil.copy2(local_path, dst)
+
+MODEL_PATH = f'{C.LOCAL_OUT}/best_model.pth'
+
+# ============================================================================
+# DATASET
+# ============================================================================
+
+class RoadDataset(Dataset):
+    def __init__(self, img_dir, lbl_dir, img_size=640, augment=False):
+        self.img_dir  = Path(img_dir)
+        self.lbl_dir  = Path(lbl_dir)
+        self.img_size = img_size
+        self.augment  = augment
+        self.imgs = sorted(
+            list(self.img_dir.glob("*.jpg")) +
+            list(self.img_dir.glob("*.png"))
+        )
+        print(f"  {len(self.imgs)} images <- {img_dir}")
+
+    def __len__(self):
+        return len(self.imgs)
+
+    def __getitem__(self, idx):
+        # Load and resize
+        img = cv2.imread(str(self.imgs[idx]))
+        img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+        img = cv2.resize(img, (self.img_size, self.img_size))
+
+        # Augmentation
+        if self.augment:
+            if np.random.rand() > 0.5:
+                img = np.fliplr(img).copy()
+            img = np.clip(
+                img * np.random.uniform(0.75, 1.25), 0, 255
+            ).astype(np.uint8)
+            if np.random.rand() > 0.5:
+                img = np.flipud(img).copy()
+
+        img = torch.from_numpy(
+            img.astype(np.float32) / 255.0
+        ).permute(2, 0, 1)
+
+        # Load labels
+        lbl = self.lbl_dir / (self.imgs[idx].stem + '.txt')
+        boxes = []
+        if lbl.exists():
+            for line in open(lbl):
+                p = line.strip().split()
+                if len(p) >= 5:
+                    c, cx, cy, w, h = map(float, p[:5])
+                    if 0 < cx < 1 and 0 < cy < 1 and 0 < w < 1 and 0 < h < 1:
+                        boxes.append([c, cx, cy, w, h])
+
+        boxes = (torch.tensor(boxes, dtype=torch.float32)
+                 if boxes else torch.zeros((0, 5)))
+        return img, boxes
+
+def collate_fn(batch):
+    imgs, boxes = zip(*batch)
+    return torch.stack(imgs), list(boxes)
+
+# ============================================================================
+# MODEL ARCHITECTURE
+# ============================================================================
+
+class ConvBnAct(nn.Module):
+    def __init__(self, c_in, c_out, k=3):
+        super().__init__()
+        self.conv = nn.Conv2d(c_in, c_out, k, stride=1, padding=k//2, bias=False)
+        self.bn   = nn.BatchNorm2d(c_out)
+        self.act  = nn.SiLU(inplace=True)
+
+    def forward(self, x):
+        return self.act(self.bn(self.conv(x)))
+
+
+class ResBlock(nn.Module):
+    def __init__(self, c):
+        super().__init__()
+        self.cv1 = ConvBnAct(c, c, 3)
+        self.cv2 = ConvBnAct(c, c, 3)
+
+    def forward(self, x):
+        return x + self.cv2(self.cv1(x))
+
+
+class DetectionHead(nn.Module):
+    def __init__(self, c_in, num_classes):
+        super().__init__()
+        self.refine = ConvBnAct(c_in, c_in, 3)
+        self.predict = nn.Conv2d(c_in, 5 + num_classes, 1)
+
+    def forward(self, x):
+        return self.predict(self.refine(x))
+
+
+class RoadDefectNet(nn.Module):
+    def __init__(self, num_classes=5):
+        super().__init__()
+        self.nc = num_classes
+
+        self.stem = nn.Sequential(
+            ConvBnAct(3, 32, k=3),
+            nn.MaxPool2d(2, 2)
+        )
+
+        self.s1 = nn.Sequential(
+            ConvBnAct(32, 64, k=3),
+            ResBlock(64),
+            nn.MaxPool2d(2, 2)
+        )
+
+        self.s2 = nn.Sequential(
+            ConvBnAct(64, 128, k=3),
+            ResBlock(128),
+            nn.MaxPool2d(2, 2)
+        )
+
+        self.s3 = nn.Sequential(
+            ConvBnAct(128, 128, k=3),
+            ResBlock(128),
+            nn.MaxPool2d(2, 2)
+        )
+
+        self.s4 = nn.Sequential(
+            ConvBnAct(128, 128, k=3),
+            nn.MaxPool2d(2, 2)
+        )
+
+        self.head_80 = DetectionHead(128, num_classes)
+        self.head_20 = DetectionHead(128, num_classes)
+
+        # Better bias initialization
+        for head in [self.head_80, self.head_20]:
+            b = head.predict.bias.data
+            b[0] = -2.0
+            head.predict.bias = nn.Parameter(b)
+
+    def forward(self, x):
+        x  = self.stem(x)
+        x  = self.s1(x)
+        p1 = self.s2(x)
+        x  = self.s3(p1)
+        p2 = self.s4(x)
+
+        out_80 = self.head_80(p1)
+        out_20 = self.head_20(p2)
+
+        return {'large': out_80, 'small': out_20}
+
+# ============================================================================
+# FOCAL LOSS
+# ============================================================================
+
+class FocalLoss(nn.Module):
+    def __init__(self, alpha=0.25, gamma=2.0):
+        super().__init__()
+        self.alpha = alpha
+        self.gamma = gamma
+
+    def forward(self, inputs, targets):
+        bce_loss = F.binary_cross_entropy_with_logits(
+            inputs, targets, reduction='none'
+        )
+        pt = torch.exp(-bce_loss)
+        focal_loss = self.alpha * (1 - pt) ** self.gamma * bce_loss
+        return focal_loss.mean()
+
+# ============================================================================
+# DETECTION LOSS
+# ============================================================================
+
+class DetectionLoss(nn.Module):
+    def __init__(self, num_classes=5):
+        super().__init__()
+        self.nc = num_classes
+        self.focal_obj = FocalLoss(alpha=0.25, gamma=2.0)
+        self.bce_cls = nn.BCEWithLogitsLoss()
+        self.w_obj = 10.0
+        self.w_box = 0.05
+        self.w_cls = 0.5
+
+    def forward_single(self, pred, targets, device):
+        B = pred.size(0)
+        G = pred.size(2)
+
+        p     = pred.permute(0, 2, 3, 1).contiguous()
+        p_obj = p[..., 0]
+        p_box = p[..., 1:5]
+        p_cls = p[..., 5:]
+
+        t_obj = torch.zeros(B, G, G,         device=device)
+        t_box = torch.zeros(B, G, G, 4,      device=device)
+        t_cls = torch.zeros(B, G, G, self.nc, device=device)
+
+        n_pos = 0
+        for b in range(B):
+            for tgt in targets[b]:
+                if tgt.numel() == 0:
+                    continue
+                c  = int(tgt[0].item())
+                cx = tgt[1].item()
+                cy = tgt[2].item()
+                w  = tgt[3].item()
+                h  = tgt[4].item()
+
+                if not (0 < cx < 1 and 0 < cy < 1):
+                    continue
+                if not (0 <= c < self.nc):
+                    continue
+
+                gx = min(int(cx * G), G - 1)
+                gy = min(int(cy * G), G - 1)
+
+                t_obj[b, gy, gx]    = 1.0
+                t_box[b, gy, gx]    = torch.tensor([cx, cy, w, h], device=device)
+                t_cls[b, gy, gx, c] = 1.0
+                n_pos += 1
+
+        loss_obj = self.focal_obj(p_obj.flatten(), t_obj.flatten())
+
+        loss_box = torch.tensor(0., device=device)
+        loss_cls = torch.tensor(0., device=device)
+
+        if n_pos > 0:
+            mask = (t_obj == 1.0)
+            pb   = torch.sigmoid(p_box[mask])
+            tb   = t_box[mask]
+            diff = (pb - tb).abs()
+            loss_box = torch.where(
+                diff < 1, 0.5 * diff ** 2, diff - 0.5
+            ).mean()
+            loss_cls = self.bce_cls(p_cls[mask], t_cls[mask])
+
+        total = (self.w_obj * loss_obj +
+                 self.w_box * loss_box +
+                 self.w_cls * loss_cls)
+
+        return total, loss_obj.item(), loss_box.item(), loss_cls.item()
+
+    def forward(self, preds, targets):
+        device = preds['large'].device
+        loss_large, o1, b1, c1 = self.forward_single(preds['large'], targets, device)
+        loss_small, o2, b2, c2 = self.forward_single(preds['small'], targets, device)
+        total = loss_large + loss_small
+        return total, {
+            'obj': o1 + o2,
+            'box': b1 + b2,
+            'cls': c1 + c2
+        }
+
+# ============================================================================
+# TRAINING
+# ============================================================================
+
+def train(drive_ok):
+    device = 'cuda' if torch.cuda.is_available() else 'cpu'
+    print(f"\n  Device : {device}")
+    if device == 'cuda':
+        print(f"  GPU    : {torch.cuda.get_device_name(0)}")
+
+    print("\n[2/4] Loading data...")
+    train_ds = RoadDataset(C.TRAIN_IMG, C.TRAIN_LBL, C.IMG_SIZE, augment=True)
+    val_ds   = RoadDataset(C.VALID_IMG, C.VALID_LBL, C.IMG_SIZE, augment=False)
+
+    train_dl = DataLoader(train_ds, C.BATCH_SIZE, shuffle=True,
+                          num_workers=2, collate_fn=collate_fn,
+                          pin_memory=True, drop_last=True)
+    val_dl   = DataLoader(val_ds, C.BATCH_SIZE, shuffle=False,
+                          num_workers=2, collate_fn=collate_fn,
+                          pin_memory=True)
+
+    print("\n[3/4] Building model...")
+    model = RoadDefectNet(C.NUM_CLASSES).to(device)
+    n_params = sum(p.numel() for p in model.parameters())
+    print(f"  Parameters : {n_params:,} ({n_params/1e6:.2f}M)")
+
+    with torch.no_grad():
+        dummy = torch.zeros(1, 3, C.IMG_SIZE, C.IMG_SIZE).to(device)
+        out   = model(dummy)
+        G_large = out['large'].size(2)
+        G_small = out['small'].size(2)
+    print(f"  Head 80x80 : {out['large'].shape}  stride={C.IMG_SIZE//G_large}")
+    print(f"  Head 20x20 : {out['small'].shape}  stride={C.IMG_SIZE//G_small}")
+
+    assert G_large == 80, f"ERROR: Expected 80x80 grid, got {G_large}x{G_large}"
+    assert G_small == 20, f"ERROR: Expected 20x20 grid, got {G_small}x{G_small}"
+    print(f"  ✓ Grid sizes correct!")
+
+    optimizer = torch.optim.SGD(
+        model.parameters(),
+        lr=C.LR,
+        momentum=C.MOMENTUM,
+        weight_decay=C.WD,
+        nesterov=True
+    )
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+        optimizer, C.NUM_EPOCHS, eta_min=1e-5
+    )
+    criterion = DetectionLoss(C.NUM_CLASSES)
+
+    print(f"\n[4/4] Training for {C.NUM_EPOCHS} epochs...")
+    print(f"  Warmup: First {C.WARMUP_EPOCHS} epochs = objectness only")
+
+    history    = {'train': [], 'val': [], 'obj': [], 'box': [], 'cls': []}
+    best_val   = float('inf')
+    no_improve = 0
+
+    for ep in range(C.NUM_EPOCHS):
+        # Warmup
+        if ep < C.WARMUP_EPOCHS:
+            criterion.w_obj = 10.0
+            criterion.w_box = 0.0
+            criterion.w_cls = 0.0
+        else:
+            criterion.w_obj = 10.0
+            criterion.w_box = 0.05
+            criterion.w_cls = 0.5
+
+        # Train
+        model.train()
+        tl = to = tb = tc = 0
+
+        pbar = tqdm(train_dl, desc=f"Ep {ep+1:03d}/{C.NUM_EPOCHS}", leave=False)
+        for imgs, tgts in pbar:
+            imgs = imgs.to(device)
+            optimizer.zero_grad()
+            preds = model(imgs)
+            loss, ld = criterion(preds, tgts)
+
+            if not torch.isnan(loss):
+                loss.backward()
+                torch.nn.utils.clip_grad_norm_(model.parameters(), 10.0)
+                optimizer.step()
+                tl += loss.item()
+                to += ld['obj']
+                tb += ld['box']
+                tc += ld['cls']
+
+            pbar.set_postfix(loss=f"{loss.item():.3f}", obj=f"{ld['obj']:.3f}")
+
+        # Validate
+        model.eval()
+        vl = 0
+        with torch.no_grad():
+            for imgs, tgts in val_dl:
+                loss, _ = criterion(model(imgs.to(device)), tgts)
+                if not torch.isnan(loss):
+                    vl += loss.item()
+
+        n      = len(train_dl)
+        avg_t  = tl / n
+        avg_v  = vl / len(val_dl)
+        scheduler.step()
+
+        history['train'].append(avg_t)
+        history['val'].append(avg_v)
+        history['obj'].append(to / n)
+        history['box'].append(tb / n)
+        history['cls'].append(tc / n)
+
+        warmup_tag = " [WARMUP]" if ep < C.WARMUP_EPOCHS else ""
+        print(f"Ep {ep+1:03d}: "
+              f"train={avg_t:.4f} val={avg_v:.4f} | "
+              f"obj={to/n:.4f} box={tb/n:.4f} cls={tc/n:.4f} | "
+              f"lr={scheduler.get_last_lr()[0]:.5f}{warmup_tag}")
+
+        # Objectness monitor
+        if (ep + 1) % 10 == 0:
+            with torch.no_grad():
+                s    = next(iter(val_dl))[0][:1].to(device)
+                out  = model(s)
+                mo_l = torch.sigmoid(out['large'].permute(0,2,3,1)[0,:,:,0]).max().item()
+                mo_s = torch.sigmoid(out['small'].permute(0,2,3,1)[0,:,:,0]).max().item()
+                obj_80 = torch.sigmoid(out['large'].permute(0,2,3,1)[0,:,:,0]).flatten()
+                p50_80 = obj_80.median().item()
+                p90_80 = obj_80.quantile(0.9).item()
+            print(f"  -> Objectness 80x80: max={mo_l:.4f} median={p50_80:.4f} p90={p90_80:.4f}")
+            print(f"  -> Objectness 20x20: max={mo_s:.4f}")
+
+        # Save best
+        if avg_v < best_val:
+            best_val   = avg_v
+            no_improve = 0
+            torch.save({
+                'epoch'            : ep,
+                'model_state_dict' : model.state_dict(),
+                'loss'             : best_val,
+                'num_classes'      : C.NUM_CLASSES,
+                'class_names'      : C.CLASS_NAMES,
+                'img_size'         : C.IMG_SIZE,
+                'G_large'          : G_large,
+                'G_small'          : G_small,
+            }, MODEL_PATH)
+            print(f"  -> Saved best (val={best_val:.4f})")
+            save_to_drive(MODEL_PATH, drive_ok)
+        else:
+            no_improve += 1
+            if no_improve >= C.PATIENCE:
+                print(f"\n  Early stop at epoch {ep+1}")
+                break
+
+    # Plot history
+    fig, axes = plt.subplots(1, 2, figsize=(14, 5))
+    axes[0].plot(history['train'], label='Train')
+    axes[0].plot(history['val'],   label='Val')
+    axes[0].set_title('Total Loss')
+    axes[0].legend(); axes[0].grid(True)
+    axes[1].plot(history['obj'], label='obj')
+    axes[1].plot(history['box'], label='box')
+    axes[1].plot(history['cls'], label='cls')
+    axes[1].set_title('Loss Components')
+    axes[1].legend(); axes[1].grid(True)
+    plt.tight_layout()
+    p = f"{C.LOCAL_OUT}/training_curves.png"
+    plt.savefig(p, dpi=120); plt.close()
+    save_to_drive(p, drive_ok)
+
+    print(f"\n  Training done. Best val loss: {best_val:.4f}")
+    return model, device, G_large, G_small
+
+# ============================================================================
+# EVALUATION HELPERS
+# ============================================================================
+
+def _prep_img(img_path):
+    img = cv2.imread(str(img_path))
+    img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+    img = cv2.resize(img, (C.IMG_SIZE, C.IMG_SIZE))
+    return torch.from_numpy(
+        img.astype(np.float32) / 255.0
+    ).permute(2, 0, 1).unsqueeze(0)
+
+def _detect(model, img_path, device, G_large, G_small, threshold):
+    img     = cv2.imread(str(img_path))
+    img_rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+    h0, w0  = img_rgb.shape[:2]
+
+    t = torch.from_numpy(
+        cv2.resize(img_rgb, (C.IMG_SIZE, C.IMG_SIZE))
+        .astype(np.float32) / 255.0
+    ).permute(2, 0, 1).unsqueeze(0)
+
+    with torch.no_grad():
+        out = model(t.to(device))
+
+    dets = []
+    for key, G in [('large', G_large), ('small', G_small)]:
+        pred = out[key].permute(0, 2, 3, 1)[0]
+        for gy in range(G):
+            for gx in range(G):
+                cell = pred[gy, gx]
+                obj  = torch.sigmoid(cell[0]).item()
+                if obj < threshold:
+                    continue
+
+                x = torch.sigmoid(cell[1]).item()
+                y = torch.sigmoid(cell[2]).item()
+                w = torch.sigmoid(cell[3]).item()
+                h = torch.sigmoid(cell[4]).item()
+
+                cls_s  = torch.sigmoid(cell[5:])
+                cls_id = cls_s.argmax().item()
+                conf   = obj * cls_s[cls_id].item()
+                if conf < threshold:
+                    continue
+
+                x1 = int(max(0,  (x - w/2) * w0))
+                y1 = int(max(0,  (y - h/2) * h0))
+                x2 = int(min(w0, (x + w/2) * w0))
+                y2 = int(min(h0, (y + h/2) * h0))
+
+                if x2 > x1 and y2 > y1:
+                    dets.append({
+                        'box'      : [x1, y1, x2, y2],
+                        'conf'     : conf,
+                        'cls'      : cls_id,
+                        'cls_name' : C.CLASS_NAMES[cls_id],
+                        'scale'    : key
+                    })
+
+    return _nms(dets), img_rgb
+
+def _nms(dets):
+    dets = sorted(dets, key=lambda x: x['conf'], reverse=True)
+    keep = []
+    while dets:
+        best = dets.pop(0)
+        keep.append(best)
+        dets = [d for d in dets
+                if d['cls'] != best['cls'] or
+                _iou(d['box'], best['box']) < C.NMS_THRESH]
+    return keep
+
+def _iou(b1, b2):
+    x1 = max(b1[0], b2[0]); y1 = max(b1[1], b2[1])
+    x2 = min(b1[2], b2[2]); y2 = min(b1[3], b2[3])
+    inter = max(0, x2-x1) * max(0, y2-y1)
+    a1 = (b1[2]-b1[0]) * (b1[3]-b1[1])
+    a2 = (b2[2]-b2[0]) * (b2[3]-b2[1])
+    return inter / (a1+a2-inter) if (a1+a2-inter) > 0 else 0
+
+def _load_gt(img_path, img):
+    h, w = img.shape[:2]
+    lp   = Path(C.TEST_LBL) / (img_path.stem + '.txt')
+    gts  = []
+    if lp.exists():
+        for line in open(lp):
+            p = line.strip().split()
+            if len(p) < 5:
+                continue
+            c, xc, yc, bw, bh = map(float, p[:5])
+            gts.append({
+                'box'      : [int((xc-bw/2)*w), int((yc-bh/2)*h),
+                              int((xc+bw/2)*w), int((yc+bh/2)*h)],
+                'cls'      : int(c),
+                'cls_name' : C.CLASS_NAMES[int(c)]
+            })
+    return gts
+
+def _visualize(all_imgs, all_gts, prec, rec, f1, drive_ok):
+    n    = min(9, len(all_imgs))
+    rows = 3; cols = 3
+    fig, axes = plt.subplots(rows, cols, figsize=(18, 14))
+    axes = axes.flatten()
+
+    for idx in range(n):
+        img, preds, name = all_imgs[idx]
+        pil  = Image.fromarray(img)
+        draw = ImageDraw.Draw(pil)
+
+        for gt in all_gts[idx]:
+            x1,y1,x2,y2 = gt['box']
+            draw.rectangle([x1,y1,x2,y2], outline='green', width=3)
+            draw.text((x1, max(0,y1-16)),
+                      f"GT:{gt['cls_name']}", fill='green')
+
+        for p in preds:
+            x1,y1,x2,y2 = p['box']
+            draw.rectangle([x1,y1,x2,y2], outline='red', width=2)
+            draw.text((x1, y2+3),
+                      f"{p['cls_name']} {p['conf']:.2f}", fill='red')
+
+        axes[idx].imshow(pil)
+        axes[idx].set_title(
+            f"{name[:30]}\nGT:{len(all_gts[idx])} Pred:{len(preds)}",
+            fontsize=8
+        )
+        axes[idx].axis('off')
+
+    for idx in range(n, rows*cols):
+        axes[idx].axis('off')
+
+    plt.suptitle(
+        f"Green=Ground Truth   Red=Prediction\n"
+        f"P={prec*100:.1f}%  R={rec*100:.1f}%  F1={f1*100:.1f}%",
+        fontsize=13
+    )
+    plt.tight_layout()
+    vp = f"{C.LOCAL_OUT}/predictions.png"
+    plt.savefig(vp, dpi=150, bbox_inches='tight')
+    plt.close()
+    save_to_drive(vp, drive_ok)
+    print(f"  Visualization saved")
+
+# ============================================================================
+# EVALUATION
+# ============================================================================
+
+def evaluate(model, device, G_large, G_small, drive_ok):
+    print("\n" + "="*70)
+    print("EVALUATION ON TEST SET")
+    print("="*70)
+
+    ckpt = torch.load(MODEL_PATH, map_location=device)
+    model.load_state_dict(ckpt['model_state_dict'])
+    model.eval()
+    print(f"\n  Best model: epoch {ckpt['epoch']+1}, val_loss={ckpt['loss']:.4f}")
+
+    test_imgs = (list(Path(C.TEST_IMG).glob("*.jpg")) +
+                 list(Path(C.TEST_IMG).glob("*.png")))
+    print(f"  Test images: {len(test_imgs)}")
+
+    threshold = C.CONF_THRESH
+    print(f"\n  Using fixed threshold: {threshold}")
+
+    # Run detection
+    all_preds, all_gts, all_imgs = [], [], []
+    all_scores = []
+
+    for ip in tqdm(test_imgs, desc="Detecting"):
+        dets, img = _detect(model, ip, device, G_large, G_small, threshold)
+        all_preds.append(dets)
+        all_imgs.append((img, dets, ip.name))
+        all_gts.append(_load_gt(ip, img))
+
+        t = _prep_img(ip).to(device)
+        with torch.no_grad():
+            out = model(t)
+            for key in ['large', 'small']:
+                s = torch.sigmoid(out[key].permute(0,2,3,1)[0,:,:,0]).flatten()
+                all_scores.extend(s.cpu().numpy().tolist())
+
+    all_scores = sorted(all_scores, reverse=True)
+    print(f"  Score stats: max={all_scores[0]:.4f} "
+          f"p95={all_scores[int(len(all_scores)*0.05)]:.4f} "
+          f"p90={all_scores[int(len(all_scores)*0.10)]:.4f}")
+
+    # Metrics
+    tp = fp = fn = 0
+    cs = {n: {'tp': 0, 'fp': 0, 'fn': 0} for n in C.CLASS_NAMES}
+
+    for preds, gts in zip(all_preds, all_gts):
+        matched = set()
+        for pred in preds:
+            bi, bx = 0, -1
+            for i, gt in enumerate(gts):
+                if i in matched or pred['cls'] != gt['cls']:
+                    continue
+                iou = _iou(pred['box'], gt['box'])
+                if iou > bi:
+                    bi, bx = iou, i
+            if bi >= C.IOU_THRESH:
+                tp += 1
+                matched.add(bx)
+                cs[pred['cls_name']]['tp'] += 1
+            else:
+                fp += 1
+                cs[pred['cls_name']]['fp'] += 1
+        for i, gt in enumerate(gts):
+            if i not in matched:
+                fn += 1
+                cs[gt['cls_name']]['fn'] += 1
+
+    prec = tp / (tp + fp) if (tp + fp) > 0 else 0
+    rec  = tp / (tp + fn) if (tp + fn) > 0 else 0
+    f1   = 2*prec*rec / (prec+rec) if (prec+rec) > 0 else 0
+
+    print("\n" + "="*70)
+    print("RESULTS")
+    print("="*70)
+    print(f"\n  Precision : {prec*100:.1f}%")
+    print(f"  Recall    : {rec*100:.1f}%")
+    print(f"  F1 Score  : {f1*100:.1f}%")
+    print(f"  TP={tp}  FP={fp}  FN={fn}")
+    print(f"  Total detections   : {tp+fp}")
+    print(f"  Total ground truth : {tp+fn}")
+
+    print(f"\n  Per-class:")
+    for name in C.CLASS_NAMES:
+        s  = cs[name]
+        tot = s['tp'] + s['fp'] + s['fn']
+        if tot == 0:
+            continue
+        p2 = s['tp']/(s['tp']+s['fp']) if (s['tp']+s['fp']) > 0 else 0
+        r2 = s['tp']/(s['tp']+s['fn']) if (s['tp']+s['fn']) > 0 else 0
+        f2 = 2*p2*r2/(p2+r2) if (p2+r2) > 0 else 0
+        print(f"    {name:<20}: P={p2*100:.0f}%  R={r2*100:.0f}%  "
+              f"F1={f2*100:.0f}%  "
+              f"(TP={s['tp']} FP={s['fp']} FN={s['fn']})")
+
+    # Save results
+    results = {
+        'precision': prec, 'recall': rec, 'f1': f1,
+        'tp': tp, 'fp': fp, 'fn': fn,
+        'threshold': threshold,
+        'per_class': {n: cs[n] for n in C.CLASS_NAMES}
+    }
+    rp = f"{C.LOCAL_OUT}/results.json"
+    with open(rp, 'w') as f:
+        json.dump(results, f, indent=2)
+    save_to_drive(rp, drive_ok)
+
+    _visualize(all_imgs, all_gts, prec, rec, f1, drive_ok)
+
+    print(f"\n  Outputs saved: {C.LOCAL_OUT}")
+    if drive_ok:
+        print(f"  Drive copy   : {C.DRIVE_OUT}")
+    print("="*70)
+
+# ============================================================================
+# MAIN PIPELINE
+# ============================================================================
+
+def main():
+    print("\n" + "=" * 80)
+    print("ROAD DEFECT DETECTION — COMPLETE PIPELINE")
+    print("=" * 80)
+    print("\nThis script will:")
+    print("  1. Extract & validate your dataset")
+    print("  2. Clean corrupted/invalid data")
+    print("  3. Train the model with all fixes")
+    print("  4. Evaluate on test set")
+    print("\n" + "=" * 80)
+
+    # Step 1: Setup dataset
+    dataset_path = setup_dataset()
+    if dataset_path is None:
+        return
+
+    # Step 2: Analyze dataset
+    stats = analyze_dataset(dataset_path)
+
+    # Step 3: Clean dataset
+    class_counts, total_boxes = clean_dataset(stats)
+
+    # Set config paths
+    base = Path(dataset_path)
+    C.TRAIN_IMG = str(base / 'train' / 'images')
+    C.TRAIN_LBL = str(base / 'train' / 'labels')
+    C.VALID_IMG = str(base / 'valid' / 'images')
+    C.VALID_LBL = str(base / 'valid' / 'labels')
+    C.TEST_IMG  = str(base / 'test' / 'images')
+    C.TEST_LBL  = str(base / 'test' / 'labels')
+
+    # Step 4: Setup output
+    print("\n" + "=" * 80)
+    print("STEP 4: TRAINING SETUP")
+    print("=" * 80)
+    drive_ok = setup_output()
+
+    # Step 5: Train
+    print("\n" + "=" * 80)
+    print("STEP 5: MODEL TRAINING")
+    print("=" * 80)
+    model, device, G_large, G_small = train(drive_ok)
+
+    # Step 6: Evaluate
+    print("\n" + "=" * 80)
+    print("STEP 6: EVALUATION")
+    print("=" * 80)
+    evaluate(model, device, G_large, G_small, drive_ok)
+
+    print("\n" + "=" * 80)
+    print("✓ PIPELINE COMPLETE!")
+    print("=" * 80)
+    print(f"\nResults saved to: {C.LOCAL_OUT}")
+    if drive_ok:
+        print(f"Backup saved to: {C.DRIVE_OUT}")
+
+if __name__ == '__main__':
+    main()
+
+#test_data_split
+
+import shutil, random
+from pathlib import Path
+
+random.seed(42)
+
+valid_imgs = sorted(list(
+    Path('/content/filtered_road_defects/valid/images').glob("*.jpg")
+))
+
+to_move = random.sample(valid_imgs, 100)
+
+for ip in to_move:
+    lp = Path('/content/filtered_road_defects/valid/labels') / (ip.stem + '.txt')
+    shutil.move(str(ip), f'/content/filtered_road_defects/test/images/{ip.name}')
+    if lp.exists():
+        shutil.move(str(lp), f'/content/filtered_road_defects/test/labels/{lp.name}')
+
+test_count  = len(list(Path('/content/filtered_road_defects/test/images').glob('*.jpg')))
+valid_count = len(list(Path('/content/filtered_road_defects/valid/images').glob('*.jpg')))
+
+print(f"Test  : {test_count}   (should be 106)")
+print(f"Valid : {valid_count}  (should be 127)")
+
+"""data evaluation and training again"""
+
+from google.colab import drive
+drive.mount('/content/drive')
+
+import os
+from pathlib import Path
+
+# One single project folder for everything from now on
+PROJECT = '/content/drive/MyDrive/RoadDefect_Project_all_in'
+
+folders = [
+    'dataset/train/images',
+    'dataset/train/labels',
+    'dataset/valid/images',
+    'dataset/valid/labels',
+    'dataset/test/images',
+    'dataset/test/labels',
+    'diagnostics',
+    'training_runs',
+    'models',
+    'results',
+]
+
+for f in folders:
+    os.makedirs(f'{PROJECT}/{f}', exist_ok=True)
+
+print("Project folder created:")
+for f in folders:
+    print(f"  {PROJECT}/{f}")
+
+import os, json, zipfile, cv2
+import numpy as np
+from pathlib import Path
+from collections import defaultdict
+from tqdm import tqdm
+
+PROJECT = '/content/drive/MyDrive/RoadDefect_Project_all_in'
+DATASET = '/content/filtered_road_defects'
+
+# ── 1. Extract ──────────────────────────────────────────────────────────────
+print("=" * 60)
+print("EXTRACTING DATASET")
+print("=" * 60)
+
+if os.path.exists(DATASET):
+    import shutil
+    shutil.rmtree(DATASET)
+
+with zipfile.ZipFile('/content/filtered_road_defects.zip', 'r') as z:
+    z.extractall('/content/')
+print(f"✓ Extracted to {DATASET}")
+
+# ── 2. Basic counts ──────────────────────────────────────────────────────────
+print("\n" + "=" * 60)
+print("BASIC COUNTS")
+print("=" * 60)
+
+splits = ['train', 'valid', 'test']
+for split in splits:
+    imgs = list(Path(DATASET, split, 'images').glob("*.jpg")) + \
+           list(Path(DATASET, split, 'images').glob("*.png"))
+    lbls = list(Path(DATASET, split, 'labels').glob("*.txt"))
+    print(f"  {split:<8}: {len(imgs)} images, {len(lbls)} labels")
+
+# ── 3. Deep label analysis ───────────────────────────────────────────────────
+print("\n" + "=" * 60)
+print("DEEP LABEL ANALYSIS")
+print("=" * 60)
+
+CLASS_NAMES = ['Crack', 'Edge_breaking', 'Guard_stone', 'Ravelling', 'pothole']
+
+class_counts   = defaultdict(int)
+box_widths     = defaultdict(list)
+box_heights    = defaultdict(list)
+box_areas      = defaultdict(list)
+aspect_ratios  = defaultdict(list)
+img_sizes      = []
+boxes_per_img  = []
+errors         = []
+
+all_imgs = []
+for split in splits:
+    all_imgs += list(Path(DATASET, split, 'images').glob("*.jpg"))
+    all_imgs += list(Path(DATASET, split, 'images').glob("*.png"))
+
+print(f"\nAnalyzing {len(all_imgs)} images...")
+
+for ip in tqdm(all_imgs):
+    img = cv2.imread(str(ip))
+    if img is None:
+        errors.append(f"Corrupted: {ip.name}")
+        continue
+    H, W = img.shape[:2]
+    img_sizes.append((W, H))
+
+    lp = ip.parent.parent / 'labels' / (ip.stem + '.txt')
+    if not lp.exists():
+        errors.append(f"No label: {ip.name}")
+        continue
+
+    boxes_this_img = 0
+    for line in open(lp):
+        p = line.strip().split()
+        if len(p) < 5:
+            continue
+        cls, cx, cy, w, h = map(float, p[:5])
+        cls = int(cls)
+        if not (0 <= cls <= 4):
+            errors.append(f"Bad class {cls}: {ip.name}")
+            continue
+        if not (0 < cx < 1 and 0 < cy < 1 and 0 < w < 1 and 0 < h < 1):
+            errors.append(f"Bad coords: {ip.name}")
+            continue
+
+        # Pixel sizes at actual image resolution
+        pw = w * W
+        ph = h * H
+        area = pw * ph
+        ar = pw / ph if ph > 0 else 0
+
+        class_counts[cls]      += 1
+        box_widths[cls].append(pw)
+        box_heights[cls].append(ph)
+        box_areas[cls].append(area)
+        aspect_ratios[cls].append(ar)
+        boxes_this_img += 1
+
+    boxes_per_img.append(boxes_this_img)
+
+# ── 4. Image size summary ────────────────────────────────────────────────────
+print("\n" + "=" * 60)
+print("IMAGE SIZES")
+print("=" * 60)
+ws = [s[0] for s in img_sizes]
+hs = [s[1] for s in img_sizes]
+unique_sizes = set(img_sizes)
+print(f"  Unique sizes : {len(unique_sizes)}")
+for sz in sorted(unique_sizes)[:10]:
+    count = img_sizes.count(sz)
+    print(f"    {sz[0]}x{sz[1]} : {count} images")
+if len(unique_sizes) > 10:
+    print(f"    ... and {len(unique_sizes)-10} more")
+print(f"  Width  : min={min(ws)} max={max(ws)} mean={np.mean(ws):.0f}")
+print(f"  Height : min={min(hs)} max={max(hs)} mean={np.mean(hs):.0f}")
+
+# ── 5. Class distribution ────────────────────────────────────────────────────
+print("\n" + "=" * 60)
+print("CLASS DISTRIBUTION")
+print("=" * 60)
+total_boxes = sum(class_counts.values())
+for i, name in enumerate(CLASS_NAMES):
+    n = class_counts[i]
+    pct = n / total_boxes * 100 if total_boxes > 0 else 0
+    print(f"  {i}. {name:<20}: {n:5d} boxes ({pct:5.1f}%)")
+print(f"\n  TOTAL : {total_boxes} boxes")
+
+# ── 6. Box size per class ────────────────────────────────────────────────────
+print("\n" + "=" * 60)
+print("BOX SIZES (pixels at original resolution)")
+print("=" * 60)
+print(f"  {'Class':<20} {'W_mean':>8} {'W_min':>8} {'H_mean':>8} {'H_min':>8} {'AR_mean':>8}")
+print(f"  {'-'*68}")
+for i, name in enumerate(CLASS_NAMES):
+    if not box_widths[i]:
+        continue
+    print(f"  {name:<20} "
+          f"{np.mean(box_widths[i]):>8.0f} "
+          f"{np.min(box_widths[i]):>8.0f} "
+          f"{np.mean(box_heights[i]):>8.0f} "
+          f"{np.min(box_heights[i]):>8.0f} "
+          f"{np.mean(aspect_ratios[i]):>8.2f}")
+
+# ── 7. Box sizes at 640x640 ──────────────────────────────────────────────────
+print("\n" + "=" * 60)
+print("BOX SIZES AT 640x640 INPUT")
+print("=" * 60)
+print(f"  {'Class':<20} {'W_mean':>8} {'W_min':>8} {'H_mean':>8} {'H_min':>8}")
+print(f"  {'-'*56}")
+mean_W = np.mean(ws)
+mean_H = np.mean(hs)
+for i, name in enumerate(CLASS_NAMES):
+    if not box_widths[i]:
+        continue
+    scale_w = 640 / mean_W
+    scale_h = 640 / mean_H
+    w_mean_640 = np.mean(box_widths[i])  * scale_w
+    w_min_640  = np.min(box_widths[i])   * scale_w
+    h_mean_640 = np.mean(box_heights[i]) * scale_h
+    h_min_640  = np.min(box_heights[i])  * scale_h
+    print(f"  {name:<20} "
+          f"{w_mean_640:>8.1f} "
+          f"{w_min_640:>8.1f} "
+          f"{h_mean_640:>8.1f} "
+          f"{h_min_640:>8.1f}")
+
+# ── 8. Objects per image ─────────────────────────────────────────────────────
+print("\n" + "=" * 60)
+print("OBJECTS PER IMAGE")
+print("=" * 60)
+print(f"  Mean   : {np.mean(boxes_per_img):.2f}")
+print(f"  Max    : {max(boxes_per_img)}")
+print(f"  Min    : {min(boxes_per_img)}")
+print(f"  Images with 0 objects : {boxes_per_img.count(0)}")
+print(f"  Images with 1 object  : {boxes_per_img.count(1)}")
+print(f"  Images with 2 objects : {boxes_per_img.count(2)}")
+print(f"  Images with 3+ objects: {sum(1 for x in boxes_per_img if x >= 3)}")
+
+# ── 9. Errors ────────────────────────────────────────────────────────────────
+print("\n" + "=" * 60)
+print("DATA QUALITY")
+print("=" * 60)
+print(f"  Errors found: {len(errors)}")
+if errors:
+    for e in errors[:10]:
+        print(f"    {e}")
+
+# ── 10. Save report to Drive ─────────────────────────────────────────────────
+report = {
+    'total_images' : len(all_imgs),
+    'total_boxes'  : total_boxes,
+    'class_counts' : dict(class_counts),
+    'errors'       : errors,
+    'image_sizes'  : list(set(img_sizes))[:20],
+    'boxes_per_img': {
+        'mean': float(np.mean(boxes_per_img)),
+        'max' : int(max(boxes_per_img)),
+        'min' : int(min(boxes_per_img)),
+    }
+}
+rp = f"{PROJECT}/diagnostics/dataset_analysis.json"
+with open(rp, 'w') as f:
+    json.dump(report, f, indent=2)
+
+print(f"\n✓ Report saved to Drive: {rp}")
+print("\n" + "=" * 60)
+print("ANALYSIS COMPLETE")
+print("=" * 60)
+
+#uniform sizing of data set
+
+import os, cv2, shutil, random
+import numpy as np
+from pathlib import Path
+from tqdm import tqdm
+from collections import defaultdict
+
+PROJECT  = '/content/drive/MyDrive/RoadDefect_Project_all_in'
+SRC      = '/content/filtered_road_defects'
+DST      = f'{PROJECT}/dataset'
+MIN_PX   = 8      # minimum box size in pixels at 640x640
+IMG_SIZE = 640
+SEED     = 42
+
+CLASS_NAMES = ['Crack', 'Edge_breaking', 'Guard_stone', 'Ravelling', 'pothole']
+
+random.seed(SEED)
+
+# ── helpers ──────────────────────────────────────────────────────────────────
+
+def process_split(split, src_base, dst_base):
+    src_img = Path(src_base, split, 'images')
+    src_lbl = Path(src_base, split, 'labels')
+    dst_img = Path(dst_base, split, 'images')
+    dst_lbl = Path(dst_base, split, 'labels')
+    dst_img.mkdir(parents=True, exist_ok=True)
+    dst_lbl.mkdir(parents=True, exist_ok=True)
+
+    imgs = sorted(
+        list(src_img.glob("*.jpg")) +
+        list(src_img.glob("*.png"))
+    )
+
+    kept_boxes   = defaultdict(int)
+    removed_tiny = 0
+    removed_bad  = 0
+    processed    = 0
+
+    for ip in tqdm(imgs, desc=f"  {split}"):
+        img = cv2.imread(str(ip))
+        if img is None:
+            continue
+
+        # Resize to 640x640
+        img_resized = cv2.resize(img, (IMG_SIZE, IMG_SIZE))
+        out_img = dst_img / (ip.stem + '.jpg')
+        cv2.imwrite(str(out_img), img_resized)
+
+        # Process labels
+        lp = src_lbl / (ip.stem + '.txt')
+        if not lp.exists():
+            continue
+
+        valid_lines = []
+        for line in open(lp):
+            p = line.strip().split()
+            if len(p) < 5:
+                continue
+
+            cls, cx, cy, w, h = map(float, p[:5])
+            cls = int(cls)
+
+            # Basic validation
+            if not (0 <= cls <= 4):
+                removed_bad += 1
+                continue
+            if not (0 < cx < 1 and 0 < cy < 1 and 0 < w < 1 and 0 < h < 1):
+                removed_bad += 1
+                continue
+
+            # Filter tiny boxes (in pixels at 640x640)
+            px_w = w * IMG_SIZE
+            px_h = h * IMG_SIZE
+            if px_w < MIN_PX or px_h < MIN_PX:
+                removed_tiny += 1
+                continue
+
+            valid_lines.append(f"{cls} {cx:.6f} {cy:.6f} {w:.6f} {h:.6f}\n")
+            kept_boxes[cls] += 1
+
+        if valid_lines:
+            with open(dst_lbl / (ip.stem + '.txt'), 'w') as f:
+                f.writelines(valid_lines)
+
+        processed += 1
+
+    return processed, kept_boxes, removed_tiny, removed_bad
+
+
+# ── Step 1: Process train and valid ─────────────────────────────────────────
+print("=" * 60)
+print("STEP 1 — PROCESSING TRAIN + VALID")
+print("=" * 60)
+
+total_kept = defaultdict(int)
+for split in ['train', 'valid']:
+    n, kept, tiny, bad = process_split(split, SRC, DST)
+    print(f"\n  {split}:")
+    print(f"    Images processed : {n}")
+    print(f"    Tiny boxes removed (<{MIN_PX}px) : {tiny}")
+    print(f"    Bad labels removed : {bad}")
+    print(f"    Boxes kept:")
+    for i, name in enumerate(CLASS_NAMES):
+        if kept[i] > 0:
+            print(f"      {name:<20}: {kept[i]}")
+            total_kept[i] += kept[i]
+
+
+# ── Step 2: Process original test (6 images) ─────────────────────────────────
+print("\n" + "=" * 60)
+print("STEP 2 — PROCESSING ORIGINAL TEST (6 images)")
+print("=" * 60)
+n, kept, tiny, bad = process_split('test', SRC, DST)
+print(f"  Images processed : {n}")
+
+
+# ── Step 3: Move 100 from valid → test ───────────────────────────────────────
+print("\n" + "=" * 60)
+print("STEP 3 — FIXING TEST SPLIT (valid → test)")
+print("=" * 60)
+
+valid_imgs = sorted(list(Path(DST, 'valid', 'images').glob("*.jpg")))
+to_move    = random.sample(valid_imgs, 100)
+
+moved = 0
+for ip in to_move:
+    lp = Path(DST, 'valid', 'labels') / (ip.stem + '.txt')
+
+    shutil.move(str(ip),
+                str(Path(DST, 'test', 'images') / ip.name))
+
+    if lp.exists():
+        shutil.move(str(lp),
+                    str(Path(DST, 'test', 'labels') / lp.name))
+    moved += 1
+
+print(f"  Moved {moved} images from valid → test")
+
+
+# ── Step 4: Final counts ─────────────────────────────────────────────────────
+print("\n" + "=" * 60)
+print("STEP 4 — FINAL DATASET COUNTS")
+print("=" * 60)
+
+grand_total_boxes = 0
+for split in ['train', 'valid', 'test']:
+    imgs = list(Path(DST, split, 'images').glob("*.jpg"))
+    lbls = list(Path(DST, split, 'labels').glob("*.txt"))
+
+    box_count = 0
+    cls_count = defaultdict(int)
+    for lp in lbls:
+        for line in open(lp):
+            p = line.strip().split()
+            if len(p) >= 5:
+                box_count += 1
+                cls_count[int(p[0])] += 1
+
+    grand_total_boxes += box_count
+    print(f"\n  {split.upper()}:")
+    print(f"    Images : {len(imgs)}")
+    print(f"    Labels : {len(lbls)}")
+    print(f"    Boxes  : {box_count}")
+    for i, name in enumerate(CLASS_NAMES):
+        if cls_count[i] > 0:
+            print(f"      {name:<20}: {cls_count[i]}")
+
+print(f"\n  GRAND TOTAL BOXES : {grand_total_boxes}")
+
+
+# ── Step 5: Verify all classes in test ───────────────────────────────────────
+print("\n" + "=" * 60)
+print("STEP 5 — CLASS COVERAGE IN TEST SET")
+print("=" * 60)
+
+test_cls = defaultdict(int)
+for lp in Path(DST, 'test', 'labels').glob("*.txt"):
+    for line in open(lp):
+        p = line.strip().split()
+        if len(p) >= 5:
+            test_cls[int(p[0])] += 1
+
+all_present = True
+for i, name in enumerate(CLASS_NAMES):
+    present = test_cls[i] > 0
+    status  = "✓" if present else "✗ MISSING"
+    print(f"  {status} {name:<20}: {test_cls[i]} boxes")
+    if not present:
+        all_present = False
+
+if all_present:
+    print("\n  ✓ All 5 classes present in test set")
+else:
+    print("\n  ⚠ Some classes missing from test set")
+    print("  → Will need to resample")
+
+
+print("\n" + "=" * 60)
+print("✓ DATASET READY")
+print(f"  Saved to: {DST}")
+print("=" * 60)
+
+#!/usr/bin/env python3
+"""
+================================================================================
+ROAD DEFECT DETECTION — TRAINING SCRIPT
+================================================================================
+Optimized for your dataset:
+  - Train: 1582 images, 3941 boxes
+  - Valid: 127 images, 307 boxes
+  - Test: 106 images, 232 boxes
+  - Object sizes: 2.9-62.2px at 640x640
+  - Avg objects/image: 2.47 (sparse!)
+
+Key fixes applied:
+  ✅ Architecture: 80×80 + 20×20 grids (MaxPool downsampling)
+  ✅ Focal Loss: handles 0.04% positive rate
+  ✅ Objectness weight: 10× (for sparse detection)
+  ✅ Bias init: -2.0 (balanced starting point)
+  ✅ Warmup: 10 epochs objectness-only
+  ✅ Threshold: 0.05 fixed
+
+Expected performance:
+  - Overall F1: 45-65%
+  - Small objects (Guard_stone): 30-40%
+  - Larger objects: 50-70%
+================================================================================
+"""
+
+import os
+import json
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.data import Dataset, DataLoader
+import cv2
+import numpy as np
+from pathlib import Path
+from tqdm import tqdm
+import matplotlib.pyplot as plt
+from PIL import Image, ImageDraw
+import warnings
+warnings.filterwarnings('ignore')
+
+# ============================================================================
+# CONFIGURATION
+# ============================================================================
+
+class Config:
+    # Dataset paths - UPDATE THESE to match your setup
+    BASE_PATH = '/content/drive/MyDrive/RoadDefect_Project_all_in/dataset'
+
+    TRAIN_IMG = f'{BASE_PATH}/train/images'
+    TRAIN_LBL = f'{BASE_PATH}/train/labels'
+    VALID_IMG = f'{BASE_PATH}/valid/images'
+    VALID_LBL = f'{BASE_PATH}/valid/labels'
+    TEST_IMG  = f'{BASE_PATH}/test/images'
+    TEST_LBL  = f'{BASE_PATH}/test/labels'
+
+    # Classes (match your data)
+    NUM_CLASSES = 5
+    CLASS_NAMES = ['Crack', 'Edge_breaking', 'Guard_stone', 'Ravelling', 'pothole']
+
+    # Input size (your objects are 2.9-62.2px at 640×640)
+    IMG_SIZE = 640
+
+    # Training hyperparameters
+    BATCH_SIZE    = 8      # Adjust based on your GPU (T4 can handle 8)
+    NUM_EPOCHS    = 60     # Increased from 50 for better convergence
+    LR            = 0.01   # Learning rate
+    MOMENTUM      = 0.937
+    WEIGHT_DECAY  = 0.0005
+    PATIENCE      = 30     # Early stopping patience
+
+    # Warmup strategy (critical for sparse detection)
+    WARMUP_EPOCHS = 10     # Train objectness only first
+
+    # Evaluation
+    IOU_THRESH    = 0.5    # IoU threshold for matching
+    NMS_THRESH    = 0.4    # NMS threshold
+    CONF_THRESH   = 0.05   # Confidence threshold (FIXED, not adaptive)
+
+    # Output paths
+    OUTPUT_BASE = '/content/drive/MyDrive/RoadDefect_Project_all_in/training_output'
+    LOCAL_OUT   = '/content/road_defect_output'
+
+C = Config
+
+# ============================================================================
+# SETUP
+# ============================================================================
+
+def setup_output():
+    """Create output directories."""
+    os.makedirs(C.LOCAL_OUT, exist_ok=True)
+
+    # Try to save to Drive
+    drive_ok = False
+    try:
+        if os.path.exists('/content/drive/MyDrive'):
+            os.makedirs(C.OUTPUT_BASE, exist_ok=True)
+            drive_ok = True
+            print(f"✓ Outputs will be saved to:")
+            print(f"  Local: {C.LOCAL_OUT}")
+            print(f"  Drive: {C.OUTPUT_BASE}")
+        else:
+            print(f"✓ Outputs will be saved to: {C.LOCAL_OUT}")
+            print(f"  (Drive not mounted)")
+    except:
+        print(f"✓ Outputs will be saved to: {C.LOCAL_OUT}")
+
+    return drive_ok
+
+def save_to_drive(local_path, drive_ok):
+    """Copy file to Drive if available."""
+    if drive_ok and os.path.exists(local_path):
+        import shutil
+        dst = local_path.replace(C.LOCAL_OUT, C.OUTPUT_BASE)
+        os.makedirs(os.path.dirname(dst), exist_ok=True)
+        shutil.copy2(local_path, dst)
+        return dst
+    return None
+
+MODEL_PATH = f'{C.LOCAL_OUT}/best_model.pth'
+
+# ============================================================================
+# DATASET
+# ============================================================================
+
+class RoadDataset(Dataset):
+    def __init__(self, img_dir, lbl_dir, img_size=640, augment=False):
+        self.img_dir  = Path(img_dir)
+        self.lbl_dir  = Path(lbl_dir)
+        self.img_size = img_size
+        self.augment  = augment
+
+        # Get all images
+        self.imgs = sorted(
+            list(self.img_dir.glob("*.jpg")) +
+            list(self.img_dir.glob("*.png"))
+        )
+
+        if len(self.imgs) == 0:
+            raise ValueError(f"No images found in {img_dir}")
+
+        print(f"  Loaded {len(self.imgs)} images from {img_dir}")
+
+    def __len__(self):
+        return len(self.imgs)
+
+    def __getitem__(self, idx):
+        # Load image
+        img_path = self.imgs[idx]
+        img = cv2.imread(str(img_path))
+        img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+
+        # Resize to 640×640
+        img = cv2.resize(img, (self.img_size, self.img_size))
+
+        # Data augmentation for training
+        if self.augment:
+            # Horizontal flip (road defects are symmetric)
+            if np.random.rand() > 0.5:
+                img = np.fliplr(img).copy()
+
+            # Brightness adjustment (lighting varies)
+            img = np.clip(
+                img * np.random.uniform(0.75, 1.25), 0, 255
+            ).astype(np.uint8)
+
+            # Vertical flip
+            if np.random.rand() > 0.5:
+                img = np.flipud(img).copy()
+
+        # Convert to tensor
+        img = torch.from_numpy(
+            img.astype(np.float32) / 255.0
+        ).permute(2, 0, 1)
+
+        # Load labels
+        lbl_path = self.lbl_dir / (img_path.stem + '.txt')
+        boxes = []
+
+        if lbl_path.exists():
+            with open(lbl_path, 'r') as f:
+                for line in f:
+                    parts = line.strip().split()
+                    if len(parts) >= 5:
+                        cls, cx, cy, w, h = map(float, parts[:5])
+
+                        # Validate
+                        if 0 < cx < 1 and 0 < cy < 1 and 0 < w < 1 and 0 < h < 1:
+                            if 0 <= int(cls) < C.NUM_CLASSES:
+                                boxes.append([cls, cx, cy, w, h])
+
+        boxes = (torch.tensor(boxes, dtype=torch.float32)
+                 if boxes else torch.zeros((0, 5)))
+
+        return img, boxes
+
+def collate_fn(batch):
+    """Custom collate function for variable-size boxes."""
+    imgs, boxes = zip(*batch)
+    return torch.stack(imgs), list(boxes)
+
+# ============================================================================
+# MODEL ARCHITECTURE
+# ============================================================================
+
+class ConvBnAct(nn.Module):
+    """Conv + BatchNorm + SiLU activation."""
+    def __init__(self, c_in, c_out, k=3):
+        super().__init__()
+        # stride=1 always, padding=k//2 preserves dimensions
+        self.conv = nn.Conv2d(c_in, c_out, k, stride=1, padding=k//2, bias=False)
+        self.bn   = nn.BatchNorm2d(c_out)
+        self.act  = nn.SiLU(inplace=True)
+
+    def forward(self, x):
+        return self.act(self.bn(self.conv(x)))
+
+
+class ResBlock(nn.Module):
+    """Residual block for stable gradients."""
+    def __init__(self, c):
+        super().__init__()
+        self.cv1 = ConvBnAct(c, c, 3)
+        self.cv2 = ConvBnAct(c, c, 3)
+
+    def forward(self, x):
+        return x + self.cv2(self.cv1(x))
+
+
+class DetectionHead(nn.Module):
+    """Detection head: features → predictions."""
+    def __init__(self, c_in, num_classes):
+        super().__init__()
+        self.refine = ConvBnAct(c_in, c_in, 3)
+        # Output: 1 objectness + 4 box coords + num_classes
+        self.predict = nn.Conv2d(c_in, 5 + num_classes, 1)
+
+    def forward(self, x):
+        return self.predict(self.refine(x))
+
+
+class RoadDefectNet(nn.Module):
+    """
+    Lightweight detector for road defects.
+
+    Input:  [B, 3, 640, 640]
+    Output:
+      'large': [B, 10, 80, 80]  - stride 8  (small objects)
+      'small': [B, 10, 20, 20]  - stride 32 (large objects)
+
+    Total params: ~1.35M
+    """
+    def __init__(self, num_classes=5):
+        super().__init__()
+        self.nc = num_classes
+
+        # Stem: 640 → 320
+        self.stem = nn.Sequential(
+            ConvBnAct(3, 32, k=3),
+            nn.MaxPool2d(2, 2)
+        )
+
+        # Stage 1: 320 → 160
+        self.s1 = nn.Sequential(
+            ConvBnAct(32, 64, k=3),
+            ResBlock(64),
+            nn.MaxPool2d(2, 2)
+        )
+
+        # Stage 2: 160 → 80 (P1 - used by 80×80 head)
+        self.s2 = nn.Sequential(
+            ConvBnAct(64, 128, k=3),
+            ResBlock(128),
+            nn.MaxPool2d(2, 2)
+        )
+
+        # Stage 3: 80 → 40
+        self.s3 = nn.Sequential(
+            ConvBnAct(128, 128, k=3),
+            ResBlock(128),
+            nn.MaxPool2d(2, 2)
+        )
+
+        # Stage 4: 40 → 20 (P2 - used by 20×20 head)
+        self.s4 = nn.Sequential(
+            ConvBnAct(128, 128, k=3),
+            nn.MaxPool2d(2, 2)
+        )
+
+        # Detection heads
+        self.head_80 = DetectionHead(128, num_classes)
+        self.head_20 = DetectionHead(128, num_classes)
+
+        # Bias initialization for objectness
+        # sigmoid(-2.0) = 0.119 - balanced starting point
+        for head in [self.head_80, self.head_20]:
+            b = head.predict.bias.data
+            b[0] = -2.0
+            head.predict.bias = nn.Parameter(b)
+
+    def forward(self, x):
+        x  = self.stem(x)   # [B, 32,  320, 320]
+        x  = self.s1(x)     # [B, 64,  160, 160]
+        p1 = self.s2(x)     # [B, 128,  80,  80]
+        x  = self.s3(p1)    # [B, 128,  40,  40]
+        p2 = self.s4(x)     # [B, 128,  20,  20]
+
+        out_80 = self.head_80(p1)  # [B, 10, 80, 80]
+        out_20 = self.head_20(p2)  # [B, 10, 20, 20]
+
+        return {'large': out_80, 'small': out_20}
+
+# ============================================================================
+# FOCAL LOSS (Critical for sparse detection)
+# ============================================================================
+
+class FocalLoss(nn.Module):
+    """
+    Focal Loss - designed for extreme class imbalance.
+
+    Your dataset: 2.47 objects / 6800 cells = 0.036% positive rate
+    Regular BCE would converge to "predict nothing everywhere"
+    Focal Loss down-weights easy negatives, focuses on objects.
+    """
+    def __init__(self, alpha=0.25, gamma=2.0):
+        super().__init__()
+        self.alpha = alpha  # Weight for positive class
+        self.gamma = gamma  # Focusing parameter
+
+    def forward(self, inputs, targets):
+        """
+        inputs:  [N] logits
+        targets: [N] binary (0 or 1)
+        """
+        bce_loss = F.binary_cross_entropy_with_logits(
+            inputs, targets, reduction='none'
+        )
+        pt = torch.exp(-bce_loss)  # Probability of correct class
+        focal_loss = self.alpha * (1 - pt) ** self.gamma * bce_loss
+        return focal_loss.mean()
+
+# ============================================================================
+# DETECTION LOSS
+# ============================================================================
+
+class DetectionLoss(nn.Module):
+    def __init__(self, num_classes=5):
+        super().__init__()
+        self.nc = num_classes
+
+        # Use Focal Loss for objectness (NOT regular BCE!)
+        self.focal_obj = FocalLoss(alpha=0.25, gamma=2.0)
+        self.bce_cls   = nn.BCEWithLogitsLoss()
+
+        # Loss weights - objectness is CRITICAL for sparse detection
+        self.w_obj = 10.0  # High weight - must detect objects!
+        self.w_box = 0.05  # Low - box coords already 0-1
+        self.w_cls = 0.5   # Medium
+
+    def forward_single(self, pred, targets, device):
+        """Compute loss for one detection scale."""
+        B = pred.size(0)
+        G = pred.size(2)  # Grid size (80 or 20)
+
+        # Reshape: [B, 10, G, G] → [B, G, G, 10]
+        p     = pred.permute(0, 2, 3, 1).contiguous()
+        p_obj = p[..., 0]      # [B, G, G] objectness
+        p_box = p[..., 1:5]    # [B, G, G, 4] box coords
+        p_cls = p[..., 5:]     # [B, G, G, 5] class logits
+
+        # Build targets
+        t_obj = torch.zeros(B, G, G,         device=device)
+        t_box = torch.zeros(B, G, G, 4,      device=device)
+        t_cls = torch.zeros(B, G, G, self.nc, device=device)
+
+        n_pos = 0
+        for b in range(B):
+            for tgt in targets[b]:
+                if tgt.numel() == 0:
+                    continue
+
+                cls = int(tgt[0].item())
+                cx  = tgt[1].item()
+                cy  = tgt[2].item()
+                w   = tgt[3].item()
+                h   = tgt[4].item()
+
+                # Validate
+                if not (0 < cx < 1 and 0 < cy < 1):
+                    continue
+                if not (0 <= cls < self.nc):
+                    continue
+
+                # Find responsible cell
+                gx = min(int(cx * G), G - 1)
+                gy = min(int(cy * G), G - 1)
+
+                # Assign targets
+                t_obj[b, gy, gx]    = 1.0
+                t_box[b, gy, gx]    = torch.tensor([cx, cy, w, h], device=device)
+                t_cls[b, gy, gx, cls] = 1.0
+                n_pos += 1
+
+        # Objectness loss (on ALL cells) - uses Focal Loss
+        loss_obj = self.focal_obj(p_obj.flatten(), t_obj.flatten())
+
+        # Box and class loss (only on positive cells)
+        loss_box = torch.tensor(0., device=device)
+        loss_cls = torch.tensor(0., device=device)
+
+        if n_pos > 0:
+            mask = (t_obj == 1.0)
+
+            # Box loss: Smooth L1
+            pb   = torch.sigmoid(p_box[mask])
+            tb   = t_box[mask]
+            diff = (pb - tb).abs()
+            loss_box = torch.where(
+                diff < 1, 0.5 * diff ** 2, diff - 0.5
+            ).mean()
+
+            # Class loss: BCE
+            loss_cls = self.bce_cls(p_cls[mask], t_cls[mask])
+
+        total = (self.w_obj * loss_obj +
+                 self.w_box * loss_box +
+                 self.w_cls * loss_cls)
+
+        return total, loss_obj.item(), loss_box.item(), loss_cls.item()
+
+    def forward(self, preds, targets):
+        device = preds['large'].device
+
+        # Compute loss for both scales
+        loss_large, o1, b1, c1 = self.forward_single(preds['large'], targets, device)
+        loss_small, o2, b2, c2 = self.forward_single(preds['small'], targets, device)
+
+        total = loss_large + loss_small
+
+        return total, {
+            'obj': o1 + o2,
+            'box': b1 + b2,
+            'cls': c1 + c2
+        }
+
+# ============================================================================
+# TRAINING
+# ============================================================================
+
+def train(drive_ok):
+    device = 'cuda' if torch.cuda.is_available() else 'cpu'
+
+    print("\n" + "=" * 80)
+    print("TRAINING SETUP")
+    print("=" * 80)
+    print(f"\nDevice: {device}")
+    if device == 'cuda':
+        print(f"GPU: {torch.cuda.get_device_name(0)}")
+        print(f"Memory: {torch.cuda.get_device_properties(0).total_memory / 1e9:.1f} GB")
+    else:
+        print("⚠ WARNING: Training on CPU will be VERY slow!")
+
+    # Load data
+    print("\n" + "=" * 80)
+    print("LOADING DATA")
+    print("=" * 80)
+
+    train_ds = RoadDataset(C.TRAIN_IMG, C.TRAIN_LBL, C.IMG_SIZE, augment=True)
+    val_ds   = RoadDataset(C.VALID_IMG, C.VALID_LBL, C.IMG_SIZE, augment=False)
+
+    train_dl = DataLoader(
+        train_ds, C.BATCH_SIZE, shuffle=True,
+        num_workers=2, collate_fn=collate_fn,
+        pin_memory=True, drop_last=True
+    )
+    val_dl = DataLoader(
+        val_ds, C.BATCH_SIZE, shuffle=False,
+        num_workers=2, collate_fn=collate_fn,
+        pin_memory=True
+    )
+
+    # Build model
+    print("\n" + "=" * 80)
+    print("BUILDING MODEL")
+    print("=" * 80)
+
+    model = RoadDefectNet(C.NUM_CLASSES).to(device)
+    n_params = sum(p.numel() for p in model.parameters())
+    print(f"\nParameters: {n_params:,} ({n_params/1e6:.2f}M)")
+
+    # Verify output shapes
+    with torch.no_grad():
+        dummy = torch.zeros(1, 3, C.IMG_SIZE, C.IMG_SIZE).to(device)
+        out   = model(dummy)
+        G_large = out['large'].size(2)
+        G_small = out['small'].size(2)
+
+    print(f"\nOutput shapes:")
+    print(f"  80×80 head: {out['large'].shape}  (stride {C.IMG_SIZE//G_large})")
+    print(f"  20×20 head: {out['small'].shape}  (stride {C.IMG_SIZE//G_small})")
+
+    # Verify correctness
+    assert G_large == 80, f"ERROR: Expected 80×80, got {G_large}×{G_large}"
+    assert G_small == 20, f"ERROR: Expected 20×20, got {G_small}×{G_small}"
+    print("✓ Grid sizes correct!")
+
+    # Optimizer
+    optimizer = torch.optim.SGD(
+        model.parameters(),
+        lr=C.LR,
+        momentum=C.MOMENTUM,
+        weight_decay=C.WEIGHT_DECAY,
+        nesterov=True
+    )
+
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+        optimizer, C.NUM_EPOCHS, eta_min=1e-5
+    )
+
+    criterion = DetectionLoss(C.NUM_CLASSES)
+
+    # Training loop
+    print("\n" + "=" * 80)
+    print("TRAINING")
+    print("=" * 80)
+    print(f"\nEpochs: {C.NUM_EPOCHS}")
+    print(f"Batch size: {C.BATCH_SIZE}")
+    print(f"Warmup: First {C.WARMUP_EPOCHS} epochs (objectness only)")
+    print(f"Early stopping: {C.PATIENCE} epochs patience")
+    print()
+
+    history = {
+        'train': [], 'val': [],
+        'obj': [], 'box': [], 'cls': []
+    }
+    best_val   = float('inf')
+    no_improve = 0
+
+    for ep in range(C.NUM_EPOCHS):
+        # Warmup strategy
+        if ep < C.WARMUP_EPOCHS:
+            criterion.w_obj = 10.0
+            criterion.w_box = 0.0
+            criterion.w_cls = 0.0
+        else:
+            criterion.w_obj = 10.0
+            criterion.w_box = 0.05
+            criterion.w_cls = 0.5
+
+        # Training
+        model.train()
+        train_loss = train_obj = train_box = train_cls = 0
+
+        pbar = tqdm(train_dl, desc=f"Epoch {ep+1:02d}/{C.NUM_EPOCHS}", leave=False)
+        for imgs, targets in pbar:
+            imgs = imgs.to(device)
+
+            optimizer.zero_grad()
+            preds = model(imgs)
+            loss, ld = criterion(preds, targets)
+
+            if not torch.isnan(loss):
+                loss.backward()
+                torch.nn.utils.clip_grad_norm_(model.parameters(), 10.0)
+                optimizer.step()
+
+                train_loss += loss.item()
+                train_obj  += ld['obj']
+                train_box  += ld['box']
+                train_cls  += ld['cls']
+
+            pbar.set_postfix({
+                'loss': f"{loss.item():.3f}",
+                'obj': f"{ld['obj']:.3f}"
+            })
+
+        # Validation
+        model.eval()
+        val_loss = 0
+
+        with torch.no_grad():
+            for imgs, targets in val_dl:
+                loss, _ = criterion(model(imgs.to(device)), targets)
+                if not torch.isnan(loss):
+                    val_loss += loss.item()
+
+        # Compute averages
+        n_train = len(train_dl)
+        avg_train = train_loss / n_train
+        avg_val   = val_loss / len(val_dl)
+
+        scheduler.step()
+
+        # Record history
+        history['train'].append(avg_train)
+        history['val'].append(avg_val)
+        history['obj'].append(train_obj / n_train)
+        history['box'].append(train_box / n_train)
+        history['cls'].append(train_cls / n_train)
+
+        # Print progress
+        warmup_tag = " [WARMUP]" if ep < C.WARMUP_EPOCHS else ""
+        print(f"Epoch {ep+1:02d}/{C.NUM_EPOCHS}: "
+              f"train={avg_train:.4f} val={avg_val:.4f} | "
+              f"obj={train_obj/n_train:.4f} "
+              f"box={train_box/n_train:.4f} "
+              f"cls={train_cls/n_train:.4f} | "
+              f"lr={scheduler.get_last_lr()[0]:.5f}{warmup_tag}")
+
+        # Monitor objectness every 10 epochs
+        if (ep + 1) % 10 == 0:
+            with torch.no_grad():
+                sample = next(iter(val_dl))[0][:1].to(device)
+                out = model(sample)
+
+                obj_80 = torch.sigmoid(out['large'].permute(0,2,3,1)[0,:,:,0])
+                obj_20 = torch.sigmoid(out['small'].permute(0,2,3,1)[0,:,:,0])
+
+                max_80 = obj_80.max().item()
+                max_20 = obj_20.max().item()
+                med_80 = obj_80.median().item()
+                p90_80 = obj_80.flatten().quantile(0.9).item()
+
+            print(f"  → Objectness: 80×80 max={max_80:.4f} med={med_80:.4f} p90={p90_80:.4f} | "
+                  f"20×20 max={max_20:.4f}")
+
+        # Save best model
+        if avg_val < best_val:
+            best_val   = avg_val
+            no_improve = 0
+
+            torch.save({
+                'epoch': ep,
+                'model_state_dict': model.state_dict(),
+                'optimizer_state_dict': optimizer.state_dict(),
+                'loss': best_val,
+                'config': {
+                    'num_classes': C.NUM_CLASSES,
+                    'class_names': C.CLASS_NAMES,
+                    'img_size': C.IMG_SIZE,
+                    'G_large': G_large,
+                    'G_small': G_small,
+                }
+            }, MODEL_PATH)
+
+            print(f"  ✓ Saved best model (val={best_val:.4f})")
+
+            # Save to Drive
+            if drive_ok:
+                drive_path = save_to_drive(MODEL_PATH, drive_ok)
+                if drive_path:
+                    print(f"  ✓ Backed up to Drive")
+        else:
+            no_improve += 1
+            if no_improve >= C.PATIENCE:
+                print(f"\n⚠ Early stopping at epoch {ep+1} (no improvement for {C.PATIENCE} epochs)")
+                break
+
+    # Plot training curves
+    print("\n" + "=" * 80)
+    print("SAVING TRAINING CURVES")
+    print("=" * 80)
+
+    fig, axes = plt.subplots(1, 2, figsize=(14, 5))
+
+    axes[0].plot(history['train'], label='Train', linewidth=2)
+    axes[0].plot(history['val'], label='Val', linewidth=2)
+    axes[0].set_xlabel('Epoch')
+    axes[0].set_ylabel('Loss')
+    axes[0].set_title('Total Loss')
+    axes[0].legend()
+    axes[0].grid(True, alpha=0.3)
+
+    axes[1].plot(history['obj'], label='Objectness', linewidth=2)
+    axes[1].plot(history['box'], label='Box', linewidth=2)
+    axes[1].plot(history['cls'], label='Class', linewidth=2)
+    axes[1].set_xlabel('Epoch')
+    axes[1].set_ylabel('Loss')
+    axes[1].set_title('Loss Components')
+    axes[1].legend()
+    axes[1].grid(True, alpha=0.3)
+
+    plt.tight_layout()
+
+    curve_path = f"{C.LOCAL_OUT}/training_curves.png"
+    plt.savefig(curve_path, dpi=150, bbox_inches='tight')
+    plt.close()
+
+    print(f"✓ Saved to: {curve_path}")
+    if drive_ok:
+        save_to_drive(curve_path, drive_ok)
+        print(f"✓ Backed up to Drive")
+
+    print(f"\n✓ Training complete!")
+    print(f"  Best validation loss: {best_val:.4f}")
+    print(f"  Model saved: {MODEL_PATH}")
+
+    return model, device, G_large, G_small
+
+# ============================================================================
+# EVALUATION HELPERS
+# ============================================================================
+
+def _iou(b1, b2):
+    """Calculate IoU between two boxes."""
+    x1 = max(b1[0], b2[0])
+    y1 = max(b1[1], b2[1])
+    x2 = min(b1[2], b2[2])
+    y2 = min(b1[3], b2[3])
+
+    inter = max(0, x2-x1) * max(0, y2-y1)
+    area1 = (b1[2]-b1[0]) * (b1[3]-b1[1])
+    area2 = (b2[2]-b2[0]) * (b2[3]-b2[1])
+    union = area1 + area2 - inter
+
+    return inter / union if union > 0 else 0
+
+def _nms(dets):
+    """Non-maximum suppression."""
+    dets = sorted(dets, key=lambda x: x['conf'], reverse=True)
+    keep = []
+
+    while dets:
+        best = dets.pop(0)
+        keep.append(best)
+
+        dets = [d for d in dets
+                if d['cls'] != best['cls'] or
+                _iou(d['box'], best['box']) < C.NMS_THRESH]
+
+    return keep
+
+def _detect(model, img_path, device, G_large, G_small, threshold):
+    """Run detection on a single image."""
+    # Load and resize
+    img = cv2.imread(str(img_path))
+    img_rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+    h0, w0 = img_rgb.shape[:2]
+
+    img_tensor = torch.from_numpy(
+        cv2.resize(img_rgb, (C.IMG_SIZE, C.IMG_SIZE))
+        .astype(np.float32) / 255.0
+    ).permute(2, 0, 1).unsqueeze(0)
+
+    # Inference
+    with torch.no_grad():
+        out = model(img_tensor.to(device))
+
+    # Decode predictions
+    dets = []
+    for key, G in [('large', G_large), ('small', G_small)]:
+        pred = out[key].permute(0, 2, 3, 1)[0]  # [G, G, 10]
+
+        for gy in range(G):
+            for gx in range(G):
+                cell = pred[gy, gx]
+
+                # Objectness
+                obj = torch.sigmoid(cell[0]).item()
+                if obj < threshold:
+                    continue
+
+                # Box coordinates
+                x = torch.sigmoid(cell[1]).item()
+                y = torch.sigmoid(cell[2]).item()
+                w = torch.sigmoid(cell[3]).item()
+                h = torch.sigmoid(cell[4]).item()
+
+                # Class
+                cls_scores = torch.sigmoid(cell[5:])
+                cls_id = cls_scores.argmax().item()
+                conf = obj * cls_scores[cls_id].item()
+
+                if conf < threshold:
+                    continue
+
+                # Convert to pixel coords
+                x1 = int(max(0,  (x - w/2) * w0))
+                y1 = int(max(0,  (y - h/2) * h0))
+                x2 = int(min(w0, (x + w/2) * w0))
+                y2 = int(min(h0, (y + h/2) * h0))
+
+                if x2 > x1 and y2 > y1:
+                    dets.append({
+                        'box': [x1, y1, x2, y2],
+                        'conf': conf,
+                        'cls': cls_id,
+                        'cls_name': C.CLASS_NAMES[cls_id],
+                        'scale': key
+                    })
+
+    return _nms(dets), img_rgb
+
+def _load_gt(img_path, img):
+    """Load ground truth boxes."""
+    h, w = img.shape[:2]
+    lbl_path = Path(C.TEST_LBL) / (img_path.stem + '.txt')
+
+    gts = []
+    if lbl_path.exists():
+        with open(lbl_path, 'r') as f:
+            for line in f:
+                parts = line.strip().split()
+                if len(parts) < 5:
+                    continue
+
+                cls, cx, cy, bw, bh = map(float, parts[:5])
+
+                x1 = int((cx - bw/2) * w)
+                y1 = int((cy - bh/2) * h)
+                x2 = int((cx + bw/2) * w)
+                y2 = int((cy + bh/2) * h)
+
+                gts.append({
+                    'box': [x1, y1, x2, y2],
+                    'cls': int(cls),
+                    'cls_name': C.CLASS_NAMES[int(cls)]
+                })
+
+    return gts
+
+# ============================================================================
+# EVALUATION
+# ============================================================================
+
+def evaluate(model, device, G_large, G_small, drive_ok):
+    print("\n" + "=" * 80)
+    print("EVALUATION")
+    print("=" * 80)
+
+    # Load best model
+    ckpt = torch.load(MODEL_PATH, map_location=device)
+    model.load_state_dict(ckpt['model_state_dict'])
+    model.eval()
+
+    print(f"\nLoaded best model from epoch {ckpt['epoch']+1}")
+    print(f"Validation loss: {ckpt['loss']:.4f}")
+
+    # Get test images
+    test_imgs = (list(Path(C.TEST_IMG).glob("*.jpg")) +
+                 list(Path(C.TEST_IMG).glob("*.png")))
+
+    print(f"\nTest images: {len(test_imgs)}")
+    print(f"Confidence threshold: {C.CONF_THRESH}")
+
+    # Run detection
+    all_preds = []
+    all_gts = []
+    all_imgs = []
+
+    for img_path in tqdm(test_imgs, desc="Detecting"):
+        dets, img = _detect(model, img_path, device, G_large, G_small, C.CONF_THRESH)
+        gts = _load_gt(img_path, img)
+
+        all_preds.append(dets)
+        all_gts.append(gts)
+        all_imgs.append((img, dets, img_path.name))
+
+    # Calculate metrics
+    tp = fp = fn = 0
+    per_class = {name: {'tp': 0, 'fp': 0, 'fn': 0} for name in C.CLASS_NAMES}
+
+    for preds, gts in zip(all_preds, all_gts):
+        matched = set()
+
+        # Match predictions to ground truth
+        for pred in preds:
+            best_iou = 0
+            best_idx = -1
+
+            for i, gt in enumerate(gts):
+                if i in matched or pred['cls'] != gt['cls']:
+                    continue
+
+                iou = _iou(pred['box'], gt['box'])
+                if iou > best_iou:
+                    best_iou = iou
+                    best_idx = i
+
+            if best_iou >= C.IOU_THRESH:
+                tp += 1
+                matched.add(best_idx)
+                per_class[pred['cls_name']]['tp'] += 1
+            else:
+                fp += 1
+                per_class[pred['cls_name']]['fp'] += 1
+
+        # Count false negatives
+        for i, gt in enumerate(gts):
+            if i not in matched:
+                fn += 1
+                per_class[gt['cls_name']]['fn'] += 1
+
+    # Compute overall metrics
+    precision = tp / (tp + fp) if (tp + fp) > 0 else 0
+    recall = tp / (tp + fn) if (tp + fn) > 0 else 0
+    f1 = 2 * precision * recall / (precision + recall) if (precision + recall) > 0 else 0
+
+    # Print results
+    print("\n" + "=" * 80)
+    print("RESULTS")
+    print("=" * 80)
+
+    print(f"\nOverall:")
+    print(f"  Precision: {precision*100:.1f}%")
+    print(f"  Recall:    {recall*100:.1f}%")
+    print(f"  F1 Score:  {f1*100:.1f}%")
+    print(f"\n  TP: {tp}  FP: {fp}  FN: {fn}")
+    print(f"  Detections: {tp+fp}")
+    print(f"  Ground truth: {tp+fn}")
+
+    print(f"\nPer-class:")
+    for name in C.CLASS_NAMES:
+        stats = per_class[name]
+        total = stats['tp'] + stats['fp'] + stats['fn']
+
+        if total == 0:
+            continue
+
+        p = stats['tp'] / (stats['tp'] + stats['fp']) if (stats['tp'] + stats['fp']) > 0 else 0
+        r = stats['tp'] / (stats['tp'] + stats['fn']) if (stats['tp'] + stats['fn']) > 0 else 0
+        f = 2*p*r / (p+r) if (p+r) > 0 else 0
+
+        print(f"  {name:<20}: P={p*100:4.0f}%  R={r*100:4.0f}%  F1={f*100:4.0f}%  "
+              f"(TP={stats['tp']:3d} FP={stats['fp']:3d} FN={stats['fn']:3d})")
+
+    # Save results
+    results = {
+        'overall': {
+            'precision': precision,
+            'recall': recall,
+            'f1': f1,
+            'tp': tp,
+            'fp': fp,
+            'fn': fn
+        },
+        'per_class': {name: stats for name, stats in per_class.items()},
+        'config': {
+            'threshold': C.CONF_THRESH,
+            'iou_thresh': C.IOU_THRESH,
+            'nms_thresh': C.NMS_THRESH
+        }
+    }
+
+    result_path = f"{C.LOCAL_OUT}/results.json"
+    with open(result_path, 'w') as f:
+        json.dump(results, f, indent=2)
+
+    print(f"\n✓ Results saved to: {result_path}")
+    if drive_ok:
+        save_to_drive(result_path, drive_ok)
+        print(f"✓ Backed up to Drive")
+
+    # Visualize samples
+    print("\n" + "=" * 80)
+    print("CREATING VISUALIZATIONS")
+    print("=" * 80)
+
+    n_samples = min(9, len(all_imgs))
+    fig, axes = plt.subplots(3, 3, figsize=(18, 14))
+    axes = axes.flatten()
+
+    for idx in range(n_samples):
+        img, preds, name = all_imgs[idx]
+        pil_img = Image.fromarray(img)
+        draw = ImageDraw.Draw(pil_img)
+
+        # Draw ground truth (green)
+        for gt in all_gts[idx]:
+            x1, y1, x2, y2 = gt['box']
+            draw.rectangle([x1, y1, x2, y2], outline='green', width=3)
+            draw.text((x1, max(0, y1-15)),
+                     f"GT:{gt['cls_name']}", fill='green')
+
+        # Draw predictions (red)
+        for pred in preds:
+            x1, y1, x2, y2 = pred['box']
+            draw.rectangle([x1, y1, x2, y2], outline='red', width=2)
+            draw.text((x1, y2+2),
+                     f"{pred['cls_name']} {pred['conf']:.2f}", fill='red')
+
+        axes[idx].imshow(pil_img)
+        axes[idx].set_title(f"{name[:30]}\nGT:{len(all_gts[idx])} Pred:{len(preds)}",
+                           fontsize=9)
+        axes[idx].axis('off')
+
+    # Hide unused subplots
+    for idx in range(n_samples, 9):
+        axes[idx].axis('off')
+
+    plt.suptitle(
+        f"Green=Ground Truth   Red=Predictions\n"
+        f"Precision={precision*100:.1f}%  Recall={recall*100:.1f}%  F1={f1*100:.1f}%",
+        fontsize=14, y=0.995
+    )
+    plt.tight_layout()
+
+    vis_path = f"{C.LOCAL_OUT}/predictions.png"
+    plt.savefig(vis_path, dpi=150, bbox_inches='tight')
+    plt.close()
+
+    print(f"✓ Visualizations saved to: {vis_path}")
+    if drive_ok:
+        save_to_drive(vis_path, drive_ok)
+        print(f"✓ Backed up to Drive")
+
+    print("\n" + "=" * 80)
+    print("EVALUATION COMPLETE")
+    print("=" * 80)
+
+# ============================================================================
+# MAIN
+# ============================================================================
+
+def main():
+    print("\n" + "=" * 80)
+    print("ROAD DEFECT DETECTION — TRAINING SCRIPT")
+    print("=" * 80)
+    print("\nOptimized for your dataset:")
+    print(f"  Train: 1582 images, 3941 boxes")
+    print(f"  Valid: 127 images, 307 boxes")
+    print(f"  Test: 106 images, 232 boxes")
+    print(f"\nKey improvements:")
+    print(f"  ✓ Focal Loss (handles sparse detection)")
+    print(f"  ✓ 10× objectness weight")
+    print(f"  ✓ Warmup training ({C.WARMUP_EPOCHS} epochs)")
+    print(f"  ✓ Correct architecture (80×80 + 20×20 grids)")
+    print("=" * 80)
+
+    # Setup
+    drive_ok = setup_output()
+
+    # Train
+    model, device, G_large, G_small = train(drive_ok)
+
+    # Evaluate
+    evaluate(model, device, G_large, G_small, drive_ok)
+
+    print("\n" + "=" * 80)
+    print("✓ ALL DONE!")
+    print("=" * 80)
+    print(f"\nOutputs saved to:")
+    print(f"  {C.LOCAL_OUT}/")
+    if drive_ok:
+        print(f"  {C.OUTPUT_BASE}/")
+    print("\nFiles created:")
+    print(f"  - best_model.pth (trained model)")
+    print(f"  - training_curves.png (loss plots)")
+    print(f"  - results.json (metrics)")
+    print(f"  - predictions.png (visual results)")
+    print("=" * 80)
+
+if __name__ == '__main__':
+    main()
+
